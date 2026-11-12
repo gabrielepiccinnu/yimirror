@@ -8,6 +8,7 @@ services:
     image: yimirror-ingest:local
     container_name: yimirror-ingest
     restart: unless-stopped
+    entrypoint: ["python"]  # override ENTRYPOINT del Dockerfile (src.main)
     environment:
       - YIMIRROR_INGEST_TOKEN=${YIMIRROR_INGEST_TOKEN}
       - TZ=${TZ:-Europe/Rome}
