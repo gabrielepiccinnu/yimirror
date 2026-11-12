@@ -1,12 +1,6 @@
-# Deploy Dokploy — servizio di storage ingest, esposto SOLO via Traefik con auth.
-#
-# Il bridge (nel punto di cattura: Mac/device) POSTa i segmenti a
-#   https://ingest.tuo-dominio.tld/segments
-# con basic auth (utente/password) + header X-Ingest-Token.
-#
-# Requisiti Dokploy: dominio con DNS → IP del server; TLS automatico (Let's Encrypt)
-# via l'entrypoint `websecure` e il certResolver di Traefik configurato su Dokploy.
-# Genera la stringa basic-auth con: bash deploy/htpasswd.sh <user> <password>
+# Deploy Dokploy — ingest della diretta.
+# Routing + TLS gestiti dal DOMINIO Dokploy (domain.create); auth via
+# header X-Ingest-Token (64 hex) + rate limit interno (10 POST/min per IP).
 
 services:
   ingest:
@@ -17,6 +11,7 @@ services:
     environment:
       - YIMIRROR_INGEST_TOKEN=${YIMIRROR_INGEST_TOKEN}
       - TZ=${TZ:-Europe/Rome}
+      - YIMIRROR_RETENTION_DAYS=${YIMIRROR_RETENTION_DAYS:-7}
     volumes:
       - yimirror-data:/data
     command: ["python", "-m", "src.ingest", "--port", "8088", "--data", "/data",
@@ -29,20 +24,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-    labels:
-      - "traefik.enable=true"
-      # router: https://ingest.tuo-dominio.tld
-      - "traefik.http.routers.yimirror-ingest.rule=Host(`${YIMIRROR_DOMAIN}`)"
-      - "traefik.http.routers.yimirror-ingest.entrypoints=websecure"
-      - "traefik.http.routers.yimirror-ingest.tls=true"
-      - "traefik.http.routers.yimirror-ingest.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.yimirror-ingest.middlewares=yimirror-auth,yimirror-ratelimit"
-      - "traefik.http.services.yimirror-ingest.loadbalancer.server.port=8088"
-      # middleware basic auth (utente:password bcrypt) — genera con deploy/htpasswd.sh
-      - "traefik.http.middlewares.yimirror-auth.basicauth.users=${YIMIRROR_BASICAUTH_USERS}"
-      # rate limit: max 30 richieste/minuto per IP (i segmenti sono 1/min, largo margine)
-      - "traefik.http.middlewares.yimirror-ratelimit.ratelimit.average=30"
-      - "traefik.http.middlewares.yimirror-ratelimit.ratelimit.burst=10"
 
 volumes:
   yimirror-data:

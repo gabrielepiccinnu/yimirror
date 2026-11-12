@@ -25,6 +25,20 @@ from pathlib import Path
 
 TOKEN = os.environ.get("YIMIRROR_INGEST_TOKEN", "")
 
+_RATE = {}          # ip -> lista timestamp (rate limit semplice in-process)
+RATE_MAX = 10       # richieste POST consentite per minuto
+RATE_WINDOW = 60.0
+
+
+def rate_ok(ip: str) -> bool:
+    now = time.time()
+    hits = [t for t in _RATE.get(ip, []) if now - t < RATE_WINDOW]
+    _RATE[ip] = hits
+    if len(hits) >= RATE_MAX:
+        return False
+    hits.append(now)
+    return True
+
 
 class Handler(BaseHTTPRequestHandler):
     data_dir: Path = Path("./data")
@@ -66,6 +80,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._auth_ok():
             self.send_response(401)
+            self.end_headers()
+            return
+        if not rate_ok(self.client_address[0]):
+            self.send_response(429)
             self.end_headers()
             return
         ctype, pdict = cgi.parse_header(self.headers.get("Content-Type", ""))
