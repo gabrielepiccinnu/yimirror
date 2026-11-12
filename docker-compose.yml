@@ -17,7 +17,8 @@ services:
       - yimirror-data:/data
     command: ["-m", "src.ingest", "--port", "8088", "--data", "/data",
               "--retention-days", "7"]
-    # NESSUNA porta pubblica: l'ingest è raggiungibile solo via Traefik (auth obbligatoria)
+    ports:
+      - "8088:8088"
     expose:
       - "8088"
     healthcheck:
