@@ -27,20 +27,6 @@ services:
       timeout: 5s
       retries: 3
 
-    labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network=dokploy-network"
-      - "traefik.http.routers.yimirror-ingest.rule=Host(`${YIMIRROR_DOMAIN}`)"
-      - "traefik.http.routers.yimirror-ingest.entrypoints=websecure"
-      - "traefik.http.routers.yimirror-ingest.tls=true"
-      - "traefik.http.routers.yimirror-ingest.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.yimirror-ingest.middlewares=yimirror-auth,yimirror-ratelimit"
-      - "traefik.http.services.yimirror-ingest.loadbalancer.server.port=8088"
-      - "traefik.http.middlewares.yimirror-auth.basicauth.users=${YIMIRROR_BASICAUTH_USERS}"
-      - "traefik.http.middlewares.yimirror-ratelimit.ratelimit.average=30"
-      - "traefik.http.middlewares.yimirror-ratelimit.ratelimit.burst=10"
-
-
 networks:
   default:
     external: true
