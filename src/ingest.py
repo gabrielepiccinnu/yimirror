@@ -53,6 +53,10 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("X-Ingest-Token", "") == TOKEN
 
     def do_GET(self):
+        if not self._auth_ok():
+            self.send_response(401)
+            self.end_headers()
+            return
         if self.path.rstrip("/") == "":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
