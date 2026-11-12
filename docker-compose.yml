@@ -15,7 +15,7 @@ services:
       - YIMIRROR_RETENTION_DAYS=${YIMIRROR_RETENTION_DAYS:-7}
     volumes:
       - yimirror-data:/data
-    command: ["python", "-m", "src.ingest", "--port", "8088", "--data", "/data",
+    command: ["-m", "src.ingest", "--port", "8088", "--data", "/data",
               "--retention-days", "7"]
     # NESSUNA porta pubblica: l'ingest è raggiungibile solo via Traefik (auth obbligatoria)
     expose:
