@@ -1,0 +1,23 @@
+# Config Frigate — camera "ingresso" dal proxy video interno.
+# Record 24/7 con retention 7 giorni (richiesta utente). Detect disattivato (CPU):
+# si attiva in seguito con motion/AI (vedi findings §7i).
+mqtt:
+  enabled: false
+
+cameras:
+  ingresso:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://bridge:{FRIGATE_RTSP_PASSWORD}@mediamtx:8554/ingresso
+          roles:
+            - record
+    record:
+      enabled: true
+      retain:
+        days: 7
+        mode: all
+
+detectors: {}
+objects:
+  track: []

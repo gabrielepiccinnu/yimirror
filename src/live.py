@@ -61,9 +61,9 @@ def upload_http(path: Path, endpoint: str) -> bool:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--seconds", type=int, default=60, help="durata segmento (default 60)")
-    ap.add_argument("--source", choices=["adb", "tap"], default="adb",
-                    help="adb: tcpdump sul device (root, niente sudo host) — "
-                         "tap: sniffer UDP sull'host (richiede sudo)")
+    ap.add_argument("--source", choices=["adb", "tap", "screen"], default="adb",
+                    help="adb: tcpdump sul device (grezzo TNP) — tap: sniffer UDP "
+                         "sull'host (sudo) — screen: screenrecord → MP4 giocabili")
     ap.add_argument("--host", default=os.environ.get("YIMIRROR_TNP_HOST", "82.192.139.67"),
                     help="host TNP da catturare (default il relay)")
     ap.add_argument("--once", action="store_true")
@@ -125,6 +125,37 @@ def main() -> None:
                 reasm.feed(payload)
             finish_segment(reasm, day, start)
             return
+        if args.source == "screen":
+            # screenrecord sul device → MP4 giocabile (bitrate config, default 2 Mbps)
+            name = f"live-{datetime.now().strftime('%H%M%S')}.mp4"
+            dest = PENDING / day / name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            remote = "/sdcard/yimirror-seg.mp4"
+            bitrate = int(os.environ.get("YIMIRROR_SCREEN_BITRATE", "2000000"))
+            adb("shell", "rm", "-f", remote)
+            proc = subprocess.run(
+                [ADB, "shell", "screenrecord", "--time-limit", str(args.seconds),
+                 "--bit-rate", str(bitrate), remote],
+                capture_output=True, text=True, timeout=args.seconds + 30)
+            r = subprocess.run([ADB, "pull", remote, str(dest)],
+                               capture_output=True, text=True, timeout=120)
+            adb("shell", "rm", "-f", remote)
+            if r.returncode == 0 and dest.exists() and dest.stat().st_size > 1000:
+                log.info("segmento MP4: %s (%.1f MB)", dest.name, dest.stat().st_size / 1e6)
+                if upload == "http" and endpoint:
+                    upload_http(dest, endpoint) and dest.unlink(missing_ok=True)
+                elif upload == "rclone" and bucket:
+                    try:
+                        upload_file(str(dest), f"{REMOTE_ROOT}/{day}/{name}", bucket,
+                                    remote_name=remote_name)
+                        dest.unlink(missing_ok=True)
+                    except Exception as e:  # noqa: BLE001
+                        log.error("upload rclone fallito (riprovo): %s", e)
+            else:
+                log.warning("screenrecord fallito (rc=%s)", proc.returncode)
+            if args.once:
+                break
+            continue
         if args.source == "adb":
             # tcpdump sul device (root) → pull → parse: niente sudo sull'host
             remote = "/data/local/tmp/yimirror-seg.pcap"

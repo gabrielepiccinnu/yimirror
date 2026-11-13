@@ -1,0 +1,37 @@
+# Proxy video + Frigate (unico progetto compose sul VPS).
+# - mediamtx: server RTSP; il dispositivo di casa PUSHA lo stream (auth obbligatoria)
+# - frigate: legge da mediamtx (rete interna), registra 24/7 con retention 7 giorni,
+#   UI web su porta 8971.
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: yimirror-video-proxy
+    restart: unless-stopped
+    ports:
+      - "8554:8554"
+    environment:
+      - TZ=${TZ:-Europe/Rome}
+      # auth interna: un solo utente per publish+read
+      - MTX_AUTHINTERNALUSERS=${RTSP_USER}:${RTSP_PASS}
+      # path per camera: solo publisher esterno (Frigate legge in rete interna)
+      - MTX_PATHS_INGRESSO_SOURCE=publisher
+
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    container_name: yimirror-frigate
+    restart: unless-stopped
+    shm_size: "256mb"
+    ports:
+      - "8971:8971"
+    environment:
+      - TZ=${TZ:-Europe/Rome}
+      # Frigate sostituisce {FRIGATE_RTSP_PASSWORD} nell'URL della camera
+      - FRIGATE_RTSP_PASSWORD=${RTSP_PASS}
+    volumes:
+      - frigate-data:/media/frigate
+      - ./frigate-config.yml:/config/config.yml:ro
+    depends_on:
+      - mediamtx
+
+volumes:
+  frigate-data:

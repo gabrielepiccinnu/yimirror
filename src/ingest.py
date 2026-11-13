@@ -104,7 +104,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         name = os.path.basename(fitem.filename) or f"seg-{int(time.time())}.h264"
-        if not name.endswith(".h264"):
+        if not name.endswith((".h264", ".mp4")):
             name += ".h264"
         day = datetime.now().strftime("%Y-%m-%d")
         dest = self.data_dir / "live" / day
