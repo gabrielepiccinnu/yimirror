@@ -504,27 +504,45 @@ class TnpSession:
         # che bloccava tutto sul VPS). Prima DEVINFO per leggere close_camera;
         # se la camera è in privacy mode (close_camera=1) la riaccende; poi la
         # sequenza di avvio video (TRIGGER_SYNC → SET_RESOLUTION = il trigger).
+        # Ordine ESATTO del cold-start dell'app (tap.pcap, §7x-ter):
+        # 1300 → 03c0 (DEVE tornare 03c1 REALE: è il sync col server YI, il vero
+        # gate — se resta ffff la camera non avvia l'encoding) → 1311
+        # SET_RESOLUTION con useCount incrementale (l'app manda 1312 ×2) = trigger
+        # dei frame. NIENTE 0x2345 (è del flusso PlayerActivity, non del cold-start).
         ok = False
+        self.send_control(IOCTRL_UPDATE_CHECK_PHONE, b"\x00" * 4)
+        # TRIGGER_SYNC con retry finché reale (l'app lo manda presto e riprova)
+        synced = False
+        for _ in range(5):
+            resp = self.send_control(IOCTRL_TRIGGER_SYNC, b"\x00\x00\x00\x01", wait=2.0)
+            rt = ctrl_response_type(resp)
+            if rt is not None and rt != 0xFFFF:
+                synced = True
+                ok = True
+                break
+            time.sleep(1.0)
+        print(f"[sync] TRIGGER_SYNC reale: {synced}")
+        # SET_RESOLUTION ×2 con useCount incrementale = trigger dei frame
+        self.use_count = getattr(self, "use_count", 0)
+        for _ in range(2):
+            self.use_count += 1
+            data = b"\x00\x00\x00\x02" + struct.pack(">I", self.use_count)
+            resp = self.send_control(IOCTRL_SET_RESOLUTION, data, wait=2.0)
+            if resp is not None and ctrl_response_type(resp) != 0xFFFF:
+                ok = True
+            time.sleep(0.2)
+        # DEVINFO per close_camera (privacy mode) — dopo il trigger
         info = parse_devinfo(self.send_control(IOCTRL_DEVINFO_REQ, b"\x00" * 4))
         if info is not None:
             self.devinfo = info
-            ok = True
             print(f"[devinfo] close_camera={info['close_camera']} "
                   f"tf={info['tfstat']} hw={info['hardware_version']}")
             if info["close_camera"] == 1 and self.desired_on:
                 print("[power] camera in privacy mode → riaccendo")
                 self.set_camera_power(True)
-        for req_id, data, pause in [
-            (IOCTRL_UPDATE_CHECK_PHONE, b"\x00" * 4, 0.3),
-            (IOCTRL_TRIGGER_SYNC, b"\x00\x00\x00\x01", 1.0),
-            (IOCTRL_SET_RESOLUTION, b"\x00\x00\x00\x02\x00\x00\x00\x01", 0.5),
-            (IOCTRL_START_REALTIME, b"\x01\x02\x01\x00", 0.0),
-        ]:
-            resp = self.send_control(req_id, data)
-            if resp is not None and ctrl_response_type(resp) != 0xFFFF:
-                ok = True
-            if pause:
-                time.sleep(pause)
+                self.use_count += 1
+                self.send_control(IOCTRL_SET_RESOLUTION,
+                                  b"\x00\x00\x00\x02" + struct.pack(">I", self.use_count))
         return ok
 
     def rehandshake(self, timeout: float = 8.0) -> bool:
@@ -772,11 +790,13 @@ class TnpSession:
                 self._retry_n = getattr(self, "_retry_n", 0)
                 self._retry_n += 1
                 if self._retry_n % 2:
-                    req, dta = IOCTRL_TRIGGER_SYNC, b"\x00\x00\x00\x01"
+                    self.send_control(IOCTRL_TRIGGER_SYNC, b"\x00\x00\x00\x01", wait=2.0)
                 else:
-                    req, dta = IOCTRL_SET_RESOLUTION, \
-                        b"\x00\x00\x00\x02\x00\x00\x00\x01"
-                self.send_control(req, dta, wait=2.0)
+                    self.use_count = getattr(self, "use_count", 0) + 1
+                    self.send_control(
+                        IOCTRL_SET_RESOLUTION,
+                        b"\x00\x00\x00\x02" + struct.pack(">I", self.use_count),
+                        wait=2.0)
                 if now - last_wake >= _WAKE_INTERVAL:
                     wake_device(self.p2pid, self.license, self.servers,
                                 timeout=3.0)
