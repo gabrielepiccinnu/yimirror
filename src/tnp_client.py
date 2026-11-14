@@ -119,10 +119,17 @@ def check_device_online(p2pid: str, init_string: str, timeout: float = 4.0) -> t
 
 
 def build_p2pserverreq(p2pid: str, license_key: str = "") -> bytes:
-    """0x20 P2PServerReq — formato ESATTO dal pcap (§7u): p2pid(20) + blocco 16B.
-    Nessuna firma."""
-    body = p2pid_body(p2pid)
-    body += b"\x00" + bytes.fromhex("02a3421002000a00") + b"\x00" * 7  # blocco statico catturato
+    """0x20 P2PServerReq — forma corta da 36 B (§7x-sexies, confronto col pcap
+    coldstart app). Layout: UID(20) + 00 + 02 + token(2) + 0f 02 00 0a + 00*8.
+    Il `token` è un nonce per-round scelto dal CLIENT: l'app lo ruota a ogni
+    raffica (es. SYUPE 0x6536→0xd259→0x0a6a) e lo manda identico a tutti i
+    server della raffica. NON è un segreto, NON deriva dall'UID e NON viene
+    validato come tale dai server → un valore qualsiasi va bene. Nessuna firma.
+    (Correzione: il byte a offset 0x18 è 0x0f in tutti i device del pcap, non
+    0x10 come nel vecchio §7u.)"""
+    body = p2pid_body(p2pid)                                  # 20 B UID
+    token = os.urandom(2)                                     # nonce per-round
+    body += b"\x00\x02" + token + bytes.fromhex("0f02000a") + b"\x00" * 8
     return header(MSG_P2PSERVERREQ, len(body)) + body
 
 
