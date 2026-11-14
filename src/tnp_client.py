@@ -36,9 +36,14 @@ P2P_PORT = 32100
 
 # Ritmo dei retry/wake/check in run_video — moderato per NON saturare il relay
 # (martellarlo → rate-limit/mute, §7x-bis). Tunabile via env senza ricompilare.
-_RETRY_INTERVAL = float(os.environ.get("YIMIRROR_RETRY_INTERVAL", "30"))
-_WAKE_INTERVAL = float(os.environ.get("YIMIRROR_WAKE_INTERVAL", "90"))
-_CHECK_INTERVAL = float(os.environ.get("YIMIRROR_CHECK_INTERVAL", "10"))
+# Il cold-start della camera da sleep profondo richiede ~35 s di polling continuo
+# (§7x-quater: anche l'app ripete il controllo ~1/s per 35 s finché la camera
+# invia un 0x40 di re-invito, poi risponde e parte lo stream). Il resend del
+# controllo su sessione stabilita NON causa rate-limit (quello era handshake/wake
+# spam) → ritmo serrato. Wake 0x1a e full-reconnect restano radi.
+_RETRY_INTERVAL = float(os.environ.get("YIMIRROR_RETRY_INTERVAL", "2"))
+_WAKE_INTERVAL = float(os.environ.get("YIMIRROR_WAKE_INTERVAL", "60"))
+_CHECK_INTERVAL = float(os.environ.get("YIMIRROR_CHECK_INTERVAL", "5"))
 
 MSG_DEV_ONLINE_ACK = 0x19
 MSG_HELLO = 0x00
@@ -745,6 +750,35 @@ class TnpSession:
                 pass
             self.sock = None
 
+    def _hs_flood(self) -> None:
+        """Un colpo del FLOOD di handshake che l'app manda durante il cold-start
+        (§7x-quater: ~5-7/s di Hello 0x00 + P2PServerReq 0x20 + P2PReq 0x30 +
+        0x41 al target, finché la camera fredda si sveglia e stabilisce il
+        percorso P2P reale). È QUESTO, non il retry dei controlli, a svegliare la
+        camera. Non bloccante: le risposte le gestisce il loop di run_video."""
+        if not self.sock:
+            return
+        for srv in self.servers:
+            try:
+                self.sock.sendto(header(MSG_HELLO, 0), (srv, P2P_PORT))
+                self.sock.sendto(build_p2pserverreq(self.p2pid, self.license),
+                                 (srv, P2P_PORT))
+            except OSError:
+                pass
+        try:
+            self.sock.sendto(build_p2preq(self.p2pid, self.license),
+                             ("255.255.255.255", 32108))
+        except OSError:
+            pass
+        tgt = getattr(self, "target", None)
+        if tgt:
+            r41 = build_connect_response(self.p2pid, self.license,
+                                         b"", ts=int(time.time()))[4:]
+            try:
+                self.sock.sendto(header(MSG_CONNECT, len(r41)) + r41, tgt)
+            except OSError:
+                pass
+
     def run_video(self, seconds: float, ack_interval: float = 1.0,
                   verbose: bool = False) -> list[bytes]:
         """Loop di ricezione post-start_video: risponde alle risposte di
@@ -761,6 +795,7 @@ class TnpSession:
         last_refresh = 0.0
         last_check = 0.0
         last_wake = 0.0
+        last_hs = 0.0
         self.video_seq = 0
         self.sock.settimeout(0.2)
         while time.time() - start < seconds:
@@ -781,6 +816,11 @@ class TnpSession:
                     except OSError:
                         pass
                 last_check = now
+            # FLOOD handshake durante il cold-start (come l'app, §7x-quater):
+            # è ciò che sveglia la camera fredda. ~5/s finché non arrivano frame.
+            if not frames and now - last_hs >= 0.2:
+                self._hs_flood()
+                last_hs = now
             if (not frames and now - last_start >= _RETRY_INTERVAL
                     and hasattr(self, "p2p_password")):
                 # finché non arrivano frame: ritento l'avvio stream a ritmo
@@ -814,6 +854,18 @@ class TnpSession:
                 continue
             if data[1] == 0xF0:
                 self.sock.sendto(b"\xf1\xf0\x00\x00", self.server)
+                continue
+            if data[1] in (MSG_CHALLENGE, MSG_CONNECT):  # 0x40 re-invito / 0x41 relay
+                # §7x-quater: quando la camera esce dallo sleep RE-INVITA con 0x40;
+                # va rifirmato e risposto con 0x41 verso il target, o la sessione
+                # resta "vecchia" e lo stream non parte mai. Lo stesso vale se il
+                # relay rimanda una sua 0x41.
+                tgt = getattr(self, "target", None) or self.server
+                r41 = build_connect_response(self.p2pid, self.license,
+                                             b"", ts=int(time.time()))[4:]
+                self.sock.sendto(header(MSG_CONNECT, len(r41)) + r41, tgt)
+                continue
+            if data[1] == 0x42:  # 0x42: sessione (ri)confermata
                 continue
             if data[1] == 0xD0:
                 body = data[4:]
