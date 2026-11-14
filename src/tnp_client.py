@@ -525,11 +525,13 @@ class TnpSession:
         (§7w: la camera risponde solo ai controlli su sessioni fresche).
         Ritorna la risposta 0xd0 del relay o None."""
         if not self.refresh_session():
+            print(f"[ctrl] refresh sessione FALLITO per 0x{req_id:04x}")
             return None
         self.ctrl = 1
         self.sock.sendto(
             build_ioctrl(0, req_id, data, self.nonce_prefix, self.p2p_password),
             self.server)
+        print(f"[ctrl] inviato 0x{req_id:04x}")
         deadline = time.time() + wait
         resp = None
         while time.time() < deadline:
@@ -542,8 +544,12 @@ class TnpSession:
             body = pkt[4:]
             if body[:2] == b"\xd1\x00":
                 resp = pkt
+                rtype = struct.unpack(">H", body[12:14])[0] if len(body) >= 14 else 0
+                print(f"[ctrl] risposta a 0x{req_id:04x}: type=0x{rtype:04x}")
                 self.sock.sendto(ack_control_0xd1(0), self.server)
                 break
+        if resp is None:
+            print(f"[ctrl] nessuna risposta a 0x{req_id:04x} entro {wait}s")
         return resp
 
     def refresh_session(self) -> bool:
