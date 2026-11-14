@@ -183,8 +183,14 @@ def wake_device(p2pid: str, license_key: str, servers: list[str],
             except socket.timeout:
                 continue
             if len(data) >= 2 and data[1] == 0x1A:
-                # WakeUp_ReqAck: result nel primo byte del payload
-                result = data[8] if len(data) > 8 else 0
+                # WakeUp_ReqAck: il payload (col result) parte a offset 28 per
+                # i pacchetti f2 (Read_Header), a 4 per gli f1 (Recv_ALL §7w-q)
+                if data[0] == 0xF2 and len(data) > 28:
+                    result = data[28]
+                elif data[0] == 0xF1 and len(data) > 4:
+                    result = data[4]
+                else:
+                    result = 0
                 print(f"wake ack 0x1a ricevuto (result={result})")
                 return result == 0
     return False
