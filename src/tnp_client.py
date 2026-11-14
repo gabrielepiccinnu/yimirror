@@ -407,6 +407,55 @@ class TnpSession:
                 time.sleep(pause)
         return ok
 
+    def rehandshake(self, timeout: float = 8.0) -> bool:
+        """Handshake COMPLETO sullo stesso socket (§7w-ter: l'app rifà
+        Hello→0x20→0x30→0x40→0x41→0x42 ogni ~10 s — il wake può scattare
+        sull'N-esimo ciclo completo)."""
+        if not self.sock:
+            return False
+        s = self.sock
+        s.settimeout(1.5)
+        for srv in self.servers:
+            try:
+                s.sendto(header(MSG_HELLO, 0), (srv, P2P_PORT))
+                s.sendto(build_p2pserverreq(self.p2pid, self.license),
+                         (srv, P2P_PORT))
+            except OSError:
+                continue
+        try:
+            s.sendto(build_p2preq(self.p2pid, self.license),
+                     ("255.255.255.255", 32108))
+        except OSError:
+            pass
+        deadline = time.time() + timeout
+        target = getattr(self, "target", None)
+        r41 = build_connect_response(self.p2pid, self.license,
+                                     b"", ts=int(time.time()))[4:]
+        pkt41 = header(MSG_CONNECT, len(r41)) + r41
+        while time.time() < deadline:
+            try:
+                data, addr = s.recvfrom(65535)
+            except socket.timeout:
+                continue
+            if data[:2] == b"\xf1\x40" and len(data) >= 12:
+                body = data[4:]
+                port = struct.unpack("<H", body[2:4])[0]
+                ip = ".".join(str(b) for b in body[4:8][::-1])
+                if not (ip.startswith("192.168.") or ip.startswith("10.")):
+                    target = (ip, port)
+                    self.target = target
+            if target and data[:2] == b"\xf1\x41":
+                s.sendto(pkt41, target)
+            if data[:2] == b"\xf1\x42" and target:
+                self.h42 = data
+                self.server = addr
+                self.connected = True
+                self.ctrl = 0
+                return True
+            if data[:2] == b"\xf1\x40" and target is None:
+                pass
+        return False
+
     def send_control_fresh(self, req_id: int, data: bytes,
                            wait: float = 3.0) -> bytes | None:
         """Rinnova la sessione (0x41→0x42) e manda UN controllo con cmdNum 1
