@@ -30,7 +30,26 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--seconds", type=float, default=30)
     ap.add_argument("--dump", default="/tmp/live.h264")
+    ap.add_argument("--cloud-pass", action="store_true",
+                    help="recupera la viewPassword fresca dal cloud "
+                         "(YI_ACCOUNT/YI_PASSWORD/YI_REGION, UID via YIMIRROR_P2PID)")
     args = ap.parse_args()
+
+    if args.cloud_pass:
+        from yi_client import YiClient
+        acc, pw = os.environ.get("YI_ACCOUNT", ""), os.environ.get("YI_PASSWORD", "")
+        if not (acc and pw):
+            print("servono YI_ACCOUNT e YI_PASSWORD per --cloud-pass")
+            raise SystemExit(1)
+        yc = YiClient(region=os.environ.get("YI_REGION", "eu"))
+        yc.login(acc, pw)
+        suffix = os.environ.get("YIMIRROR_P2PID", "").split("-")[-1]
+        vp = yc.view_password_for(suffix) if suffix else None
+        if not vp:
+            print(f"viewPassword non trovata per suffisso '{suffix}' nella device list")
+            raise SystemExit(1)
+        os.environ["YIMIRROR_P2P_PASSWORD"] = vp
+        print(f"viewPassword fresca dal cloud per '{suffix}': lunghezza {len(vp)}")
 
     p2pid = os.environ.get("YIMIRROR_P2PID", "")
     license_key = os.environ.get("YIMIRROR_LICENSE", "")

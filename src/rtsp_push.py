@@ -48,6 +48,28 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
         log.error("source native: servono YIMIRROR_P2PID, YIMIRROR_LICENSE, "
                   "YIMIRROR_INIT_STRING")
         raise SystemExit(1)
+
+    def fresh_view_password() -> str:
+        """viewPassword fresca dal cloud (§7x) se c'è l'account Yi; altrimenti
+        il valore statico YIMIRROR_P2P_PASSWORD. La viewPassword ruota a ogni
+        refresh device list dell'app: col cloud il proxy resta autonomo."""
+        acc = os.environ.get("YI_ACCOUNT", "")
+        pw = os.environ.get("YI_PASSWORD", "")
+        if acc and pw:
+            try:
+                from yi_client import YiClient
+                yc = YiClient(region=os.environ.get("YI_REGION", "eu"))
+                yc.login(acc, pw)
+                suffix = p2pid.split("-")[-1]
+                vp = yc.view_password_for(suffix)
+                if vp:
+                    log.info("viewPassword dal cloud per '%s' (len %d)", suffix, len(vp))
+                    return vp
+                log.warning("viewPassword non trovata nel cloud per '%s'", suffix)
+            except Exception as exc:
+                log.warning("recupero viewPassword dal cloud fallito: %s", exc)
+        return os.environ.get("YIMIRROR_P2P_PASSWORD", "")
+
     session = TnpSession(p2pid, license_key, init_string)
     reasm = FrameReassembler(password=os.environ.get("YIMIRROR_P2P_PASSWORD", ""))
     while True:
@@ -58,7 +80,7 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                 time.sleep(30)
                 continue
             log.info("sessione attiva: %s — apertura canale video", session.server)
-            session.start_video()
+            session.start_video(password=fresh_view_password())
             reasm = FrameReassembler(password=session.p2p_password)
         cmd = ["ffmpeg", "-loglevel", "warning", "-f", "h264", "-i", "pipe:0",
                "-c", "copy", "-f", "rtsp", "-rtsp_transport", "tcp", RTSP_URL]

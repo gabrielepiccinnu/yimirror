@@ -242,6 +242,47 @@ IOCTRL_TRIGGER_SYNC = 0x03C0          # TRIGGER_SYNC_INFO_FROM_SERVER_REQ (960)
 IOCTRL_SET_RESOLUTION = 0x1311        # SET_RESOLUTION (4881): data = res(4BE)+useCount(4BE)
 IOCTRL_DEVINFO_REQ = 0x0330           # DEVINFO_REQ (816): data = 4 zero
 IOCTRL_START_REALTIME = 0x2345        # TNP_START_REALTIME (9029) ← il comando video
+IOCTRL_DEVINFO_RESP = 0x0331          # DEVINFO_RESP (817): SMsgAVIoctrlDeviceInfoResp
+# Interruttore "Camera on/off" dell'app (privacy mode reale) —
+# CameraCommandHelper.doOpenOrCloseVideo: data = int (0 = accesa, 1 = spenta),
+# big-endian per TNP (AntsCamera.isByteOrderBig, type 3); la risposta è una
+# SMsgAVIoctrlDeviceInfoResp con close_camera al byte 48.
+IOCTRL_CLOSE_CAMERA = 0x1304          # IOTYPE_USER_IPCAM_CLOSE_CAMERA_REQ (4868)
+IOCTRL_CLOSE_CAMERA_RESP = 0x130C     # IOTYPE_USER_IPCAM_CLOSE_CAMERA_RESP (4876)
+
+# offset dei dati nel corpo di una risposta di controllo:
+# d1 00 <ctr2> (4) + TNPHead (8) + TNPIOCtrlHead (40)
+CTRL_DATA_OFFSET = 4 + 8 + 40
+
+
+def ctrl_response_type(resp_pkt: bytes | None) -> int | None:
+    """commandType della risposta di controllo (0xffff = 'in coda' del relay)."""
+    if not resp_pkt or len(resp_pkt) < 18:
+        return None
+    return struct.unpack(">H", resp_pkt[4 + 12:4 + 14])[0]
+
+
+def parse_devinfo(resp_pkt: bytes | None) -> dict | None:
+    """Campi principali di SMsgAVIoctrlDeviceInfoResp (AVIOCTRLDEFs.parse) da
+    una risposta 0x0331 o 0x130C. None se la risposta non porta i dati."""
+    rtype = ctrl_response_type(resp_pkt)
+    if rtype not in (IOCTRL_DEVINFO_RESP, IOCTRL_CLOSE_CAMERA_RESP):
+        return None
+    d = resp_pkt[4 + CTRL_DATA_OFFSET:]
+    if len(d) < 55:
+        return None
+    return {
+        "type": rtype,
+        "interface_version": d[0],
+        "tfstat": d[2],
+        "hardware_version": d[8],
+        "version": struct.unpack(">I", d[32:36])[0],
+        "sd_total": struct.unpack(">I", d[40:44])[0],
+        "sd_free": struct.unpack(">I", d[44:48])[0],
+        "close_camera": d[48],
+        "close_light": d[49],
+        "record_mode": d[52],
+    }
 
 
 def gen_nonce(n: int) -> str:
@@ -310,6 +351,10 @@ class TnpSession:
         self.server: tuple[str, int] | None = None
         self.connected = False
         self.frames: list[bytes] = []
+        self.ctrl = 0
+        self.nonce_prefix = ""
+        self.p2p_password = ""
+        self.desired_on = True
 
     def connect(self, timeout: float = 8.0) -> bool:
         """Sequenza ESATTA dal wire (§7u/§7v):
@@ -447,25 +492,30 @@ class TnpSession:
                 continue
             if pkt[:2] == b"\xf1\xe0":
                 self.sock.sendto(b"\xf1\xe1\x00\x00", self.server)
-        # controlli — ordine ESATTO del wake dal pcap del lancio (§7w):
-        # 0x1300 → 0x03c0 → 8 s → 0x1311 SET_RESOLUTION (IL TRIGGER del wake:
-        # i frame arrivano ~0,1 s dopo) → 0x0330 DEVINFO — CIASCUNO su una
-        # sessione FRESCA (0x41→0x42 prima di ogni controllo)
-        steps = [
-            (IOCTRL_UPDATE_CHECK_PHONE, b"\x00" * 4, 0.3),
-            (IOCTRL_TRIGGER_SYNC, b"\x00\x00\x00\x01", 8.0),
-            (IOCTRL_SET_RESOLUTION, b"\x00\x00\x00\x02\x00\x00\x00\x01", 0.5),
-            (IOCTRL_DEVINFO_REQ, b"\x00" * 4, 0.0),
-        ]
+        # controlli DIRETTI sulla sessione connessa (§7x: niente refresh
+        # 0x41→0x42 per controllo — era la causa del 'refresh sessione FALLITO'
+        # che bloccava tutto sul VPS). Prima DEVINFO per leggere close_camera;
+        # se la camera è in privacy mode (close_camera=1) la riaccende; poi la
+        # sequenza di avvio video (TRIGGER_SYNC → SET_RESOLUTION = il trigger).
         ok = False
-        for req_id, data, pause in steps:
-            resp = self.send_control_fresh(req_id, data)
-            if resp is not None:
-                body = resp[4:]
-                rtype = struct.unpack(">H", body[12:14])[0] if len(body) >= 14 else 0
-                print(f"  <- risposta a 0x{req_id:04x}: type=0x{rtype:04x}")
-                if rtype != 0xFFFF:
-                    ok = True
+        info = parse_devinfo(self.send_control(IOCTRL_DEVINFO_REQ, b"\x00" * 4))
+        if info is not None:
+            self.devinfo = info
+            ok = True
+            print(f"[devinfo] close_camera={info['close_camera']} "
+                  f"tf={info['tfstat']} hw={info['hardware_version']}")
+            if info["close_camera"] == 1 and self.desired_on:
+                print("[power] camera in privacy mode → riaccendo")
+                self.set_camera_power(True)
+        for req_id, data, pause in [
+            (IOCTRL_UPDATE_CHECK_PHONE, b"\x00" * 4, 0.3),
+            (IOCTRL_TRIGGER_SYNC, b"\x00\x00\x00\x01", 1.0),
+            (IOCTRL_SET_RESOLUTION, b"\x00\x00\x00\x02\x00\x00\x00\x01", 0.5),
+            (IOCTRL_START_REALTIME, b"\x01\x02\x01\x00", 0.0),
+        ]:
+            resp = self.send_control(req_id, data)
+            if resp is not None and ctrl_response_type(resp) != 0xFFFF:
+                ok = True
             if pause:
                 time.sleep(pause)
         return ok
@@ -518,6 +568,52 @@ class TnpSession:
             if data[:2] == b"\xf1\x40" and target is None:
                 pass
         return False
+
+    def send_control(self, req_id: int, data: bytes,
+                     wait: float = 3.0) -> bytes | None:
+        """Invia UN controllo IOCTRL sulla sessione già connessa (NIENTE
+        refresh 0x41→0x42) e attende la risposta 0xd0/d1 00 della camera.
+
+        Verificato live (§7x): dopo la 0x42 la camera risponde ai controlli
+        direttamente, con commandType+1 (0x1300→0x1301, 0x1304→0x130c,
+        0x1311→0x1312). Il vecchio send_control_fresh rifaceva un handshake che
+        sul VPS falliva sempre ('refresh sessione FALLITO'), per cui nessun
+        controllo partiva mai. Usa un contatore di sessione self.ctrl crescente."""
+        if not self.sock or not self.server:
+            return None
+        ctr = getattr(self, "ctrl", 0)
+        self.ctrl = ctr + 1
+        self.sock.sendto(
+            build_ioctrl(ctr, req_id, data, self.nonce_prefix, self.p2p_password),
+            self.server)
+        self.sock.settimeout(0.3)
+        deadline = time.time() + wait
+        resp = None
+        while time.time() < deadline:
+            try:
+                pkt, _ = self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            if pkt[:2] == b"\xf1\xe0":
+                self.sock.sendto(b"\xf1\xe1\x00\x00", self.server)
+                continue
+            if pkt[:2] != b"\xf1\xd0" or len(pkt) < 18:
+                continue
+            body = pkt[4:]
+            if body[:2] != b"\xd1\x00":
+                continue
+            # ack del controllo (echo del contatore interno del wrapper)
+            self.sock.sendto(ack_control_0xd1(struct.unpack(">H", body[2:4])[0]),
+                             self.server)
+            rtype = struct.unpack(">H", body[12:14])[0]
+            if rtype == (req_id + 1) or rtype == 0xFFFF:
+                resp = pkt
+                print(f"[ctrl] 0x{req_id:04x} -> type=0x{rtype:04x}")
+                if rtype != 0xFFFF:
+                    break
+        if resp is None:
+            print(f"[ctrl] 0x{req_id:04x}: nessuna risposta entro {wait}s")
+        return resp
 
     def send_control_fresh(self, req_id: int, data: bytes,
                            wait: float = 3.0) -> bytes | None:
@@ -576,6 +672,44 @@ class TnpSession:
                 return True
         return False
 
+    def query_devinfo(self) -> dict | None:
+        """DEVINFO_REQ su sessione fresca → stato della camera (close_camera…)."""
+        if not getattr(self, "p2p_password", ""):
+            return None
+        info = parse_devinfo(self.send_control(IOCTRL_DEVINFO_REQ, b"\x00" * 4))
+        if info is not None:
+            self.devinfo = info
+            print(f"[devinfo] close_camera={info['close_camera']} "
+                  f"tf={info['tfstat']} hw={info['hardware_version']}")
+        return info
+
+    def set_camera_power(self, on: bool, retries: int = 3) -> bool:
+        """Privacy mode reale (CLOSE_CAMERA 0x1304): on=True accende la camera,
+        on=False la spegne. Ritorna True se la risposta conferma lo stato
+        (close_camera == 0 se on, 1 se off). Ritenta sulle risposte 'ffff'."""
+        if not getattr(self, "p2p_password", ""):
+            return False
+        want = 0 if on else 1
+        for attempt in range(1, retries + 1):
+            resp = self.send_control(IOCTRL_CLOSE_CAMERA,
+                                     struct.pack(">I", want))
+            info = parse_devinfo(resp)
+            if info is not None:
+                self.devinfo = info
+                print(f"[power] {'ON' if on else 'OFF'} → close_camera="
+                      f"{info['close_camera']} (tentativo {attempt})")
+                if info["close_camera"] == want:
+                    return True
+            else:
+                rtype = ctrl_response_type(resp)
+                print(f"[power] {'ON' if on else 'OFF'}: risposta "
+                      f"{'assente' if rtype is None else hex(rtype)} "
+                      f"(tentativo {attempt})")
+            time.sleep(2.0)
+        # ultima verifica con DEVINFO (la risposta 0x130C può perdersi)
+        info = self.query_devinfo()
+        return info is not None and info["close_camera"] == want
+
     def close(self) -> None:
         self.connected = False
         self.server = None
@@ -633,7 +767,7 @@ class TnpSession:
                 else:
                     req, dta = IOCTRL_SET_RESOLUTION, \
                         b"\x00\x00\x00\x02\x00\x00\x00\x01"
-                self.send_control_fresh(req, dta, wait=2.0)
+                self.send_control(req, dta, wait=2.0)
                 # wake 0x1a ripetuto se ancora nessun frame (§7w-quater)
                 if self._retry_n % 3 == 0:
                     wake_device(self.p2pid, self.license, self.servers,

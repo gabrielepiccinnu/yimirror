@@ -30,6 +30,24 @@ log = logging.getLogger("yimirror")
 
 DEFAULT_HMAC_KEY = "04b1aa5fb31e185f"  # ra/c1 fallback key
 
+
+def decrypt_view_password(uid: str, password_hex: str) -> str:
+    """viewPassword della camera dalla device list cloud (§7x).
+
+    L'app (n8/u1.r2 → ra.k.a → ra.a AESEnc): la viewPassword è
+    `AES-128-ECB/PKCS7-decrypt(key = UID[:16], ciphertext = hex(password))`.
+    Se `password` è vuoto l'app usa il default "888888" (ra.k.d).
+    Verificato live su 3 device dell'account (padding valido, 15 char alfanum).
+    """
+    if not password_hex:
+        return "888888"
+    from Crypto.Cipher import AES  # pycryptodome (già in requirements)
+    raw = AES.new(uid[:16].encode(), AES.MODE_ECB).decrypt(bytes.fromhex(password_hex))
+    pad = raw[-1]
+    if 1 <= pad <= 16 and raw[-pad:] == bytes([pad]) * pad:
+        raw = raw[:-pad]
+    return raw.decode("ascii", errors="strict")
+
 BASE_URLS = {
     "test": "http://test-api.us.xiaoyi.com",
     "cn": "https://api.xiaoyi.com",
@@ -48,9 +66,19 @@ GATEWAY_URLS = {
     "test": "https://gw-eu.xiaoyi.com",
 }
 
+APP_VERSION = "7.0.1_20261104115049"
+APP_VERSION_CODE = "457"
+
+# Header inviati dall'app a ogni richiesta sul gateway (cattura §7x) — alcuni
+# endpoint li richiedono; il country code è configurabile via YI_COUNTRY.
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 16; YI Home) AppleWebKit/537.36",
+    "User-Agent": f"yihome/{APP_VERSION} (docker-yimirror; Android 16; en-US)",
     "Accept": "application/json",
+    "Accept-Encoding": "gzip",
+    "x-kamihome-apptype": "ANDROID",
+    "x-kamihome-packagetype": "RELEASE",
+    "x-xiaoyi-appversion": f"android;{APP_VERSION_CODE};{APP_VERSION}",
+    "x-xiaoyi-appcountrycode": os.environ.get("YI_COUNTRY", "IT"),
 }
 
 
@@ -108,14 +136,15 @@ class YiClient:
 
     def _request(self, method: str, path: str, params: dict | None = None,
                  signed: bool = False, sort: bool = False, gateway: bool = False,
-                 **kwargs) -> dict:
+                 app_params: bool = True, **kwargs) -> dict:
         params = dict(params or {})
-        params.setdefault("seq", "1")
-        params.setdefault("timestamp", str(int(time.time())))
-        if self.token:
-            # the app sends the session token per-request; exact param name is
-            # confirmed dynamically (query `token` is the historical v4 shape)
-            params.setdefault("token", self.token)
+        if app_params:
+            params.setdefault("seq", "1")
+            params.setdefault("timestamp", str(int(time.time())))
+            if self.token:
+                # the app sends the session token per-request; exact param name is
+                # confirmed dynamically (query `token` is the historical v4 shape)
+                params.setdefault("token", self.token)
         if signed:
             params["hmac"] = sign(params, self.secret, sort=sort)
         resp = self.session.request(
@@ -132,36 +161,51 @@ class YiClient:
     # ------------------------------------------------------------------ auth
 
     def login(self, account: str, password: str) -> dict:
-        """d9/h.F: POST /v4/users/login (host api.{regione}, form body).
+        """d9/h.F: POST /v4/users/login (form body, NON firmato).
 
-        La password è cifrata con ra/d2 (HMAC-SHA256, chiave fissa) — portata in
-        `encrypt_login_password` (findings §7j).
+        Da jadx: params `account`/`email`/`mobile` + `password` (cifrata ra/d2,
+        §7j) + `dev_name`/`dev_type`/`dev_os_version` + `seq`. Successo = envelope
+        `{"code":20000,"data":{userid, token, token_secret, ...}}`. La chiave di
+        firma delle API /v5 e /vas è `token + "&" + token_secret` (§7x,
+        e9/d.s0 → e0.A()&e0.B()).
         """
-        params = {
-            "account": account,
-            "password": encrypt_login_password(password),
-            "dev_name": "docker-yimirror",
-            "dev_type": "yimirror",
-            "dev_os_version": "linux",
-        }
-        data = self._request("POST", "/v4/users/login", data=params)
+        import re
+        is_email = bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", account))
+        params = {"seq": "1"}
+        params["email" if is_email else "account"] = account
+        params["password"] = encrypt_login_password(password)
+        params["dev_name"] = "docker-yimirror"
+        params["dev_type"] = "yimirror"
+        params["dev_os_version"] = "linux"
+        data = self._request("POST", "/v4/users/login", data=params, gateway=True)
         self._adopt_session(data)
         return data
 
-    def adopt_token(self, token: str, userid: str | None = None) -> None:
+    def adopt_token(self, token: str, userid: str | None = None,
+                    token_secret: str | None = None) -> None:
         self.token = token
         self.userid = userid
+        if token and token_secret:
+            self.secret = f"{token}&{token_secret}"
 
     def _adopt_session(self, data: dict) -> None:
-        # response shape TBD dynamically; accept common spellings
-        for key in ("token", "access_token", "session_token"):
-            if isinstance(data.get(key), str) and data[key]:
-                self.token = data[key]
-                break
-        for key in ("userid", "user_id", "uid"):
-            if data.get(key) not in (None, ""):
-                self.userid = str(data[key])
-                break
+        d = data.get("data") if isinstance(data.get("data"), dict) else data
+        code = data.get("code")
+        if code not in (None, 20000):
+            raise YiCloudError(f"login code={code}: {str(data)[:200]}")
+        token = d.get("token")
+        token_secret = d.get("token_secret")
+        if d.get("userid") not in (None, ""):
+            self.userid = str(d["userid"])
+        if token:
+            self.token = token
+        # chiave di firma per-utente (token&token_secret) — SOSTITUISCE il secret
+        # placeholder; senza di essa le chiamate /v5 firmate falliscono (§7x)
+        if token and token_secret:
+            self.secret = f"{token}&{token_secret}"
+        else:
+            log.warning("_adopt_session: token/token_secret mancanti nella "
+                        "risposta login (%s)", list(d.keys())[:10])
 
     def auth_token(self) -> dict:
         """d9/e: /v4/users/auth_token — refresh flow (params token/reftoken)."""
@@ -173,8 +217,17 @@ class YiClient:
     # ------------------------------------------------------------------ devices
 
     def devices(self) -> list:
-        """Device list; each entry carries P2P creds (DeviceInfo -> P2PDevice, §3)."""
-        data = self._request("GET", "/v5/devices/list", gateway=True)
+        """Device list; each entry carries P2P creds (DeviceInfo -> P2PDevice, §3).
+
+        Cattura live (§7x): GET /v5/devices/list?userid=..&seq=1&hmac=.. sul
+        gateway, firmato su {userid, seq} (niente timestamp/token in query —
+        la sessione viaggia via cookie/header). Richiede gli header app.
+        """
+        # ordine d'inserimento ESATTO di e9/d.s0 (m0 non scarta i vuoti, no sort)
+        params = {"seq": "1", "userid": self.userid or ""}
+        params["hmac"] = sign(params, self.secret, sort=False)
+        data = self._request("GET", "/v5/devices/list", params=params,
+                             gateway=True, app_params=False)
         for key in ("devices", "list", "data"):
             if isinstance(data.get(key), list):
                 return data[key]
@@ -182,6 +235,32 @@ class YiClient:
             return data
         log.warning("devices(): unexpected shape: %s", str(data)[:200])
         return []
+
+    def view_passwords(self) -> dict:
+        """{UID: viewPassword} per ogni device dell'account (§7x).
+
+        Deriva la viewPassword dal campo `password` cifrato della device list.
+        È la credenziale che il client TNP usa per l'authInfo dei controlli e
+        per il decrypt degli I-frame; ruota a ogni refresh della device list, per
+        cui va riletta dal cloud quando la camera smette di rispondere."""
+        out: dict[str, str] = {}
+        for d in self.devices():
+            uid = d.get("uid") or d.get("UID")
+            if not uid:
+                continue
+            try:
+                out[uid] = decrypt_view_password(uid, d.get("password", ""))
+            except Exception as exc:  # pragma: no cover - diagnostica
+                log.warning("view_passwords(): decrypt fallito per %s: %s", uid, exc)
+        return out
+
+    def view_password_for(self, uid_contains: str) -> str | None:
+        """viewPassword del primo device il cui UID contiene `uid_contains`
+        (es. il suffisso 'SYUPE'). None se non trovato."""
+        for uid, pw in self.view_passwords().items():
+            if uid_contains in uid:
+                return pw
+        return None
 
     # ------------------------------------------------------------------ cloud recording (CloudApi.kt, hm/a)
 
