@@ -36,5 +36,12 @@ services:
     depends_on:
       - mediamtx
 
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: yimirror-cloudflared
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CF_TUNNEL_TOKEN}"]
+
 volumes:
   frigate-data:
