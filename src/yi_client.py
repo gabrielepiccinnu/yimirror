@@ -75,6 +75,17 @@ def sign(params: dict, secret: str, sort: bool = False) -> str:
     return hmac_sha1_base64(secret, canonical(params, sort))
 
 
+# ra/d2 (Sha256Util): cifratura della password di login — chiave fissa nell'app
+LOGIN_PASSWORD_KEY = "KXLiUdAsO81ycDyEJAeETC$KklXdz3AC"
+
+
+def encrypt_login_password(password: str) -> str:
+    """ra/d2.a: Base64(NO_WRAP, HMAC-SHA256(chiave fissa, password))."""
+    digest = hmac.new(LOGIN_PASSWORD_KEY.encode("utf-8"),
+                      password.encode("utf-8"), hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
 class YiCloudError(Exception):
     pass
 
@@ -121,20 +132,19 @@ class YiClient:
     # ------------------------------------------------------------------ auth
 
     def login(self, account: str, password: str) -> dict:
-        """d9/h.F: POST /v4/users/login.
+        """d9/h.F: POST /v4/users/login (host api.{regione}, form body).
 
-        NOTE: the app encrypts `password` with `ra/d2.b().a()` before sending; that
-        cipher is not ported yet. If the server rejects a plain password, seed
-        YI_SESSION_TOKEN instead (see README).
+        La password è cifrata con ra/d2 (HMAC-SHA256, chiave fissa) — portata in
+        `encrypt_login_password` (findings §7j).
         """
         params = {
             "account": account,
-            "password": password,
+            "password": encrypt_login_password(password),
             "dev_name": "docker-yimirror",
             "dev_type": "yimirror",
             "dev_os_version": "linux",
         }
-        data = self._request("POST", "/v4/users/login", params=params)
+        data = self._request("POST", "/v4/users/login", data=params)
         self._adopt_session(data)
         return data
 

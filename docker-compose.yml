@@ -1,49 +1,39 @@
-# Deploy Dokploy — ingest della diretta.
-# Routing + TLS gestiti dal DOMINIO Dokploy (domain.create); auth via
-# header X-Ingest-Token (64 hex) + rate limit interno (10 POST/min per IP).
+# yimirror — bridge della diretta + mirror clip + server di ingest (opzionale)
+#
+# servizio `bridge`: cattura la sorgente video TNP (sniffer UDP, host network + NET_RAW)
+#   e consegna i segmenti a: ingest HTTP (sotto) oppure rclone (B2/Drive) oppure local.
+# servizio `ingest`: il TUO server di storage — salva i segmenti e tiene la retention.
+#   Se hai già un server, esegui lì solo `src/ingest.py` e punta YIMIRROR_INGEST_URL.
 
 services:
+  bridge:
+    build: .
+    container_name: yimirror-bridge
+    restart: unless-stopped
+    network_mode: host          # deve vedere il traffico UDP del device/emulatore
+    cap_add:
+      - NET_RAW                 # socket raw per lo sniffer
+    environment:
+      - YIMIRROR_DATA_DIR=/data
+      - YIMIRROR_UPLOAD=${YIMIRROR_UPLOAD:-http}        # http | rclone | local
+      - YIMIRROR_INGEST_URL=${YIMIRROR_INGEST_URL:-http://127.0.0.1:8088}
+      - YIMIRROR_TNP_HOST=${YIMIRROR_TNP_HOST:-82.192.139.67}
+      - YIMIRROR_RETENTION_DAYS=${YIMIRROR_RETENTION_DAYS:-7}
+      - TZ=Europe/Rome
+    volumes:
+      - ./data:/data
+    command: ["python", "-m", "src.live", "--seconds", "60"]
+
   ingest:
     build: .
-    image: yimirror-ingest:local
     container_name: yimirror-ingest
     restart: unless-stopped
-    entrypoint: ["python"]  # override ENTRYPOINT del Dockerfile (src.main)
-    environment:
-      - YIMIRROR_INGEST_TOKEN=${YIMIRROR_INGEST_TOKEN}
-      - TZ=${TZ:-Europe/Rome}
-      - YIMIRROR_RETENTION_DAYS=${YIMIRROR_RETENTION_DAYS:-7}
-    volumes:
-      - yimirror-data:/data
-    command: ["-m", "src.ingest", "--port", "8088", "--data", "/data",
-              "--retention-days", "7"]
     ports:
       - "8088:8088"
-    expose:
-      - "8088"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/', timeout=5)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
-    labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network=dokploy-network"
-      - "traefik.http.routers.yimirror-ingest.rule=Host(`${YIMIRROR_DOMAIN}`)"
-      - "traefik.http.routers.yimirror-ingest.entrypoints=websecure"
-      - "traefik.http.routers.yimirror-ingest.tls=true"
-      - "traefik.http.routers.yimirror-ingest.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.yimirror-ingest.middlewares=yimirror-auth,yimirror-ratelimit"
-      - "traefik.http.services.yimirror-ingest.loadbalancer.server.port=8088"
-      - "traefik.http.middlewares.yimirror-auth.basicauth.users=${YIMIRROR_BASICAUTH_USERS}"
-      - "traefik.http.middlewares.yimirror-ratelimit.ratelimit.average=30"
-      - "traefik.http.middlewares.yimirror-ratelimit.ratelimit.burst=10"
-
-networks:
-  default:
-    external: true
-    name: dokploy-network
-
-volumes:
-  yimirror-data:
+    environment:
+      - YIMIRROR_INGEST_TOKEN=${YIMIRROR_INGEST_TOKEN:-}
+      - TZ=Europe/Rome
+    volumes:
+      - ./ingest-data:/data
+    command: ["python", "-m", "src.ingest", "--port", "8088",
+              "--data", "/data", "--retention-days", "7"]

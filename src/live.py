@@ -61,9 +61,11 @@ def upload_http(path: Path, endpoint: str) -> bool:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--seconds", type=int, default=60, help="durata segmento (default 60)")
-    ap.add_argument("--source", choices=["adb", "tap", "screen"], default="adb",
+    ap.add_argument("--source", choices=["adb", "tap", "screen", "native"], default="adb",
                     help="adb: tcpdump sul device (grezzo TNP) — tap: sniffer UDP "
-                         "sull'host (sudo) — screen: screenrecord → MP4 giocabili")
+                         "sull'host (sudo) — screen: screenrecord → MP4 giocabili — "
+                         "native: sessione TNP nativa del proxy (§7v/§7w, richiede "
+                         "YIMIRROR_P2PID/LICENSE/INIT_STRING)")
     ap.add_argument("--host", default=os.environ.get("YIMIRROR_TNP_HOST", "82.192.139.67"),
                     help="host TNP da catturare (default il relay)")
     ap.add_argument("--once", action="store_true")
@@ -82,13 +84,14 @@ def main() -> None:
     log.info("bridge: host=%s segment=%ds upload=%s retention=%dd",
              args.host, args.seconds, upload, retention)
 
-    def finish_segment(reasm: FrameReassembler, day: str, start_ts: float) -> None:
+    def finish_segment(reasm: FrameReassembler, day: str, start_ts: float,
+                       h264: bytes | None = None) -> None:
         if reasm.stats["video"] == 0:
             return
         name = f"live-{datetime.now().strftime('%H%M%S')}.h264"
         dest = PENDING / day / name
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(reasm.h264())
+        dest.write_bytes(h264 if h264 is not None else reasm.h264())
         log.info("segmento: %s (%d frame, %d B in %.0fs)",
                  dest.name, reasm.stats["video"], dest.stat().st_size,
                  time.time() - start_ts)
@@ -114,6 +117,18 @@ def main() -> None:
                         log.info("retention locale: rimosso %s", old)
                 except OSError:
                     pass
+
+    session = None
+    if args.source == "native":
+        from tnp_client import TnpSession
+        p2pid = os.environ.get("YIMIRROR_P2PID", "")
+        license_key = os.environ.get("YIMIRROR_LICENSE", "")
+        init_string = os.environ.get("YIMIRROR_INIT_STRING", "")
+        if not (p2pid and license_key and init_string):
+            log.error("source native: servono YIMIRROR_P2PID, YIMIRROR_LICENSE, "
+                      "YIMIRROR_INIT_STRING")
+            raise SystemExit(1)
+        session = TnpSession(p2pid, license_key, init_string)
 
     while True:
         day = datetime.now().strftime("%Y-%m-%d")
@@ -180,6 +195,34 @@ def main() -> None:
                 for payload in parse_pcap_udp(str(local)):
                     reasm.feed(payload)
                 local.unlink()
+        elif args.source == "native":
+            from tnp_proto import unwrap_yi_stream
+            assert session is not None
+            if session.p2p_password:
+                reasm = FrameReassembler(password=session.p2p_password)
+            if not session.connected:
+                log.info("connessione TNP...")
+                if not session.connect(timeout=10):
+                    log.warning("connect fallito — ritento tra 30 s")
+                    time.sleep(30)
+                    continue
+                log.info("sessione attiva: %s — apertura canale video", session.server)
+                session.start_video()
+            idle = time.time()
+            while time.time() - start < args.seconds:
+                got = session.run_video(1.0, ack_interval=1.0)
+                for pkt in got:
+                    reasm.feed(pkt)
+                if got:
+                    idle = time.time()
+                if time.time() - idle > 60:
+                    log.warning("nessun frame da 60 s — sessione da ristabilire")
+                    session.close()
+                    break
+            finish_segment(reasm, day, start, h264=unwrap_yi_stream(reasm.frames))
+            if args.once:
+                break
+            continue
         else:
             for payload in sniff_udp(host=args.host):
                 if payload is not None:

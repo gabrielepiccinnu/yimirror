@@ -1,4 +1,7 @@
-data/
+.env
 __pycache__/
 *.pyc
-.env
+data/
+data-test/
+deploy/.env.dokploy
+deploy/yimirror-image.tar
