@@ -33,6 +33,13 @@ KEY_54 = [0xc1, 0x6b, 0x8b, 0x95, 0x97, 0x6d, 0xa3, 0x47, 0xe3, 0x71, 0xe9, 0x67
           0x3d, 0xb5, 0xbf, 0x02, 0x03, 0x0b]
 
 P2P_PORT = 32100
+
+# Ritmo dei retry/wake/check in run_video — moderato per NON saturare il relay
+# (martellarlo → rate-limit/mute, §7x-bis). Tunabile via env senza ricompilare.
+_RETRY_INTERVAL = float(os.environ.get("YIMIRROR_RETRY_INTERVAL", "30"))
+_WAKE_INTERVAL = float(os.environ.get("YIMIRROR_WAKE_INTERVAL", "90"))
+_CHECK_INTERVAL = float(os.environ.get("YIMIRROR_CHECK_INTERVAL", "10"))
+
 MSG_DEV_ONLINE_ACK = 0x19
 MSG_HELLO = 0x00
 MSG_P2PSERVERREQ = 0x20
@@ -735,6 +742,7 @@ class TnpSession:
         last_start = 0.0
         last_refresh = 0.0
         last_check = 0.0
+        last_wake = 0.0
         self.video_seq = 0
         self.sock.settimeout(0.2)
         while time.time() - start < seconds:
@@ -744,9 +752,10 @@ class TnpSession:
                 self.video_seq = (self.video_seq + 1) & 0xFFFF
                 self.sock.sendto(b"\xf1\xe0\x00\x04\xa2\x05\x04\x00", self.server)
                 last_ack = now
-            if now - last_check >= 3.0 and self.servers:
-                # check-online costante come l'app (§7w-bis: il server sveglia
-                # la camera solo mentre vede il polling 0x18 attivo?)
+            if now - last_check >= _CHECK_INTERVAL and self.servers:
+                # check-online periodico (0x18). Ritmo moderato per non
+                # saturare il relay: martellarlo porta al rate-limit/mute del
+                # relay (§7x-bis). Tunabile via YIMIRROR_CHECK_INTERVAL.
                 for srv in self.servers:
                     try:
                         self.sock.sendto(build_check_online(self.p2pid),
@@ -754,12 +763,12 @@ class TnpSession:
                     except OSError:
                         pass
                 last_check = now
-            if (not frames and now - last_start >= 11.0
+            if (not frames and now - last_start >= _RETRY_INTERVAL
                     and hasattr(self, "p2p_password")):
-                # finché non arrivano frame: ogni ~11 s (ritmo dell'app) una
-                # sessione fresca + alternanza TRIGGER_SYNC / SET_RESOLUTION
-                # (il wake, §7w — il ffff del relay è solo 'in coda': la
-                # camera processa i controlli lentamente)
+                # finché non arrivano frame: ritento l'avvio stream a ritmo
+                # MODERATO (default 30 s, era 11 s) — alternanza TRIGGER_SYNC /
+                # SET_RESOLUTION. Il wake 0x1a è costoso e irrita il relay:
+                # lo rifaccio solo ogni _WAKE_INTERVAL (default 90 s). §7x-bis.
                 self._retry_n = getattr(self, "_retry_n", 0)
                 self._retry_n += 1
                 if self._retry_n % 2:
@@ -768,10 +777,10 @@ class TnpSession:
                     req, dta = IOCTRL_SET_RESOLUTION, \
                         b"\x00\x00\x00\x02\x00\x00\x00\x01"
                 self.send_control(req, dta, wait=2.0)
-                # wake 0x1a ripetuto se ancora nessun frame (§7w-quater)
-                if self._retry_n % 3 == 0:
+                if now - last_wake >= _WAKE_INTERVAL:
                     wake_device(self.p2pid, self.license, self.servers,
                                 timeout=3.0)
+                    last_wake = now
                 self.sock.sendto(b"\xf1\xf0\x00\x00", self.server)
                 last_start = now
             try:
