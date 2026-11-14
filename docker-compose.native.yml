@@ -1,0 +1,25 @@
+# Proxy autonomo sul VPS: sessione TNP nativa → H.264 decifrato → RTSP push
+# verso mediamtx (servizio yimirror-video, stessa rete dokploy-network) →
+# Frigate. NIENTE emulatore/app (§7w).
+services:
+  yimirror-native:
+    build:
+      context: .
+      dockerfile: Dockerfile.native
+    container_name: yimirror-native
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ:-Europe/Rome}
+      # credenziali TNP della camera (device_info del db dell'app)
+      - YIMIRROR_P2PID=${YIMIRROR_P2PID}
+      - YIMIRROR_LICENSE=${YIMIRROR_LICENSE}
+      - YIMIRROR_INIT_STRING=${YIMIRROR_INIT_STRING}
+      - YIMIRROR_P2P_PASSWORD=${YIMIRROR_P2P_PASSWORD}
+      # push interno verso mediamtx (container yimirror-video2)
+      - RTSP_URL=${RTSP_URL}
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true
