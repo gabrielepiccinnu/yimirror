@@ -33,7 +33,9 @@ services:
       - YIMIRROR_RELOAD=1
     volumes:
       - frigate-data:/media/frigate
-      - ./frigate-config.yml:/config/config.yml:ro
+    configs:
+      - source: frigate_conf
+        target: /config/config.yml
     depends_on:
       - mediamtx
 
@@ -44,5 +46,26 @@ services:
     restart: unless-stopped
     command: ["tunnel", "--no-autoupdate", "run", "--token", "${CF_TUNNEL_TOKEN}"]
 
+configs:
+  frigate_conf:
+    content: |
+      mqtt:
+        enabled: false
+
+      cameras:
+        ingresso:
+          enabled: true
+          ffmpeg:
+            inputs:
+              - path: rtsp://bridge:{FRIGATE_RTSP_PASSWORD}@mediamtx:8554/ingresso
+                roles:
+                  - record
+          record:
+            enabled: true
+            retain:
+              days: 7
+              mode: all
+
 volumes:
   frigate-data:
+
