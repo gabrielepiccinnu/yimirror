@@ -482,6 +482,7 @@ class TnpSession:
         last_sync = 0.0
         last_start = 0.0
         last_refresh = 0.0
+        last_check = 0.0
         self.video_seq = 0
         self.sock.settimeout(0.2)
         while time.time() - start < seconds:
@@ -491,6 +492,16 @@ class TnpSession:
                 self.video_seq = (self.video_seq + 1) & 0xFFFF
                 self.sock.sendto(b"\xf1\xe0\x00\x04\xa2\x05\x04\x00", self.server)
                 last_ack = now
+            if now - last_check >= 3.0 and self.servers:
+                # check-online costante come l'app (§7w-bis: il server sveglia
+                # la camera solo mentre vede il polling 0x18 attivo?)
+                for srv in self.servers:
+                    try:
+                        self.sock.sendto(build_check_online(self.p2pid),
+                                         (srv, P2P_PORT))
+                    except OSError:
+                        pass
+                last_check = now
             if (not frames and now - last_start >= 11.0
                     and hasattr(self, "p2p_password")):
                 # finché non arrivano frame: ogni ~11 s (ritmo dell'app) una
