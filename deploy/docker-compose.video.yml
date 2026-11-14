@@ -5,7 +5,7 @@
 services:
   mediamtx:
     image: bluenviron/mediamtx:latest
-    container_name: yimirror-video-proxy
+    container_name: yimirror-video2
     restart: unless-stopped
     ports:
       - "8554:8554"
@@ -21,7 +21,7 @@ services:
 
   frigate:
     image: ghcr.io/blakeblackshear/frigate:stable
-    container_name: yimirror-frigate
+    container_name: yimirror-frigate2
     restart: unless-stopped
     shm_size: "256mb"
     ports:
@@ -40,7 +40,7 @@ services:
 
   cloudflared:
     image: cloudflare/cloudflared:latest
-    container_name: yimirror-cloudflared
+    container_name: yimirror-cf2
     restart: unless-stopped
     command: ["tunnel", "--no-autoupdate", "run", "--token", "${CF_TUNNEL_TOKEN}"]
 
