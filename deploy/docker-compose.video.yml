@@ -15,6 +15,9 @@ services:
       - MTX_AUTHINTERNALUSERS=${RTSP_USER}:${RTSP_PASS}
       # path per camera: solo publisher esterno (Frigate legge in rete interna)
       - MTX_PATHS_INGRESSO_SOURCE=publisher
+      # HLS per la visione via dominio HTTPS (fg-cam1) — Cloudflare non proxya RTSP
+      - MTX_HLS=true
+      - MTX_HLSADDRESS=:8888
 
   frigate:
     image: ghcr.io/blakeblackshear/frigate:stable
