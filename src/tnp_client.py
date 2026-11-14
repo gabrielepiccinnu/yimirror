@@ -137,6 +137,59 @@ def build_connect_response(p2pid: str, license_key: str, challenge: bytes,
     return header(MSG_CONNECT, len(body)) + body
 
 
+def build_wakeup_packet(p2pid: str, license_key: str) -> bytes:
+    """MSG_DEV_WAKEUP_REQ (0x1a, 48 B) — il comando di wake della camera
+    (§7w-quater, da PPPP_Proto_Send_WakeUp/Write_HeaderV2 via Ghidra):
+    f2 1a len16(20) 00 | prefix(8) | sn(4BE) |
+    HMAC-SHA1(License, primi 20 B) | prefix(7) | sn(4BE) | checkcode(7)."""
+    prefix, sn, check = split_p2pid(p2pid)
+    pkt = bytearray(48)
+    pkt[0] = 0xF2                       # magic header V2
+    pkt[1] = 0x1A                       # MSG_DEV_WAKEUP_REQ
+    pkt[2:4] = struct.pack(">H", 20)    # len16 = 20
+    pkt[4] = 0
+    pkt[8:16] = prefix.encode()[:7].ljust(8, b"\x00")
+    pkt[0x10:0x14] = struct.pack(">I", sn)
+    sig = hmac.new(license_key.encode(), pkt[:0x14], hashlib.sha1).digest()
+    pkt[0x14:0x28] = sig                # HMAC sui primi 20 B
+    pkt[0x1C:0x23] = prefix.encode()[:7].ljust(7, b"\x00")
+    pkt[0x24:0x28] = struct.pack(">I", sn)
+    pkt[0x28:0x2F] = check.encode()[:5].ljust(7, b"\x00")
+    return bytes(pkt)
+
+
+def wake_device(p2pid: str, license_key: str, servers: list[str],
+                timeout: float = 6.0) -> bool:
+    """Invia MSG_DEV_WAKEUP_REQ ai server P2P da un socket dedicato con porta
+    bindata e attende l'ack 0x1a (PPPP_TryWakeUp). Ritorna True se ack-ato."""
+    pkt = build_wakeup_packet(p2pid, license_key)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind(("0.0.0.0", 0))
+    except OSError:
+        pass
+    s.settimeout(0.5)
+    start = time.time()
+    while time.time() - start <= timeout:
+        for srv in servers:
+            try:
+                s.sendto(pkt, (srv, P2P_PORT))
+            except OSError:
+                continue
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            try:
+                data, _ = s.recvfrom(2048)
+            except socket.timeout:
+                continue
+            if len(data) >= 2 and data[1] == 0x1A:
+                # WakeUp_ReqAck: result nel primo byte del payload
+                result = data[8] if len(data) > 8 else 0
+                print(f"wake ack 0x1a ricevuto (result={result})")
+                return result == 0
+    return False
+
+
 def build_devlgn(p2pid: str, key: str, nonce: str,
                  local_addr: bytes = b"\x00" * 16,
                  api_version: int = 0x0001, dat_byte: int = 0,
@@ -357,6 +410,10 @@ class TnpSession:
             raise RuntimeError("YIMIRROR_P2P_PASSWORD non impostata "
                                "(viewPassword della camera, vedi .env.example)")
         self.p2p_password = password
+        # WAKE: MSG_DEV_WAKEUP_REQ 0x1a dai server (§7w-quater — il passo che
+        # sveglia la camera, mai catturato nei pcap: avviene pre-connect)
+        print("wake device...")
+        wake_device(self.p2pid, self.license, self.servers)
         # check-online 0x18 a tutti i server (l'app lo manda di continuo)
         for srv in self.servers:
             try:
@@ -565,13 +622,10 @@ class TnpSession:
                     req, dta = IOCTRL_SET_RESOLUTION, \
                         b"\x00\x00\x00\x02\x00\x00\x00\x01"
                 self.send_control_fresh(req, dta, wait=2.0)
-                # knock LAN (§7w: per le camere con wakeup=1 la 0x41 diretta
-                # alla camera è parte del wake — SYUPE la richiede)
-                lan = getattr(self, "lan_target", None)
-                if lan:
-                    r41 = build_connect_response(self.p2pid, self.license,
-                                                 b"", ts=int(time.time()))[4:]
-                    self.sock.sendto(header(MSG_CONNECT, len(r41)) + r41, lan)
+                # wake 0x1a ripetuto se ancora nessun frame (§7w-quater)
+                if self._retry_n % 3 == 0:
+                    wake_device(self.p2pid, self.license, self.servers,
+                                timeout=3.0)
                 self.sock.sendto(b"\xf1\xf0\x00\x00", self.server)
                 last_start = now
             try:
