@@ -30,10 +30,10 @@ services:
       - TZ=${TZ:-Europe/Rome}
       # Frigate sostituisce {FRIGATE_RTSP_PASSWORD} nell'URL della camera
       - FRIGATE_RTSP_PASSWORD=${RTSP_PASS}
-      - YIMIRROR_RELOAD=4
+      - YIMIRROR_RELOAD=5
     volumes:
       - frigate-data:/media/frigate
-      - ./deploy/frigate-config.yml:/config/config.yml:ro
+      - ./frigate-config.yml:/config/config.yml:ro
     depends_on:
       - mediamtx
 
