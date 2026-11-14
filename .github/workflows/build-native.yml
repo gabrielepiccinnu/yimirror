@@ -26,6 +26,8 @@ jobs:
           context: .
           file: Dockerfile.native
           push: true
-          tags: ghcr.io/gabrielepiccinnu/yimirror-native:latest
+          tags: |
+            ghcr.io/gabrielepiccinnu/yimirror-native:latest
+            ghcr.io/gabrielepiccinnu/yimirror-native:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
