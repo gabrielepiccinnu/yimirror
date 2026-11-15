@@ -128,7 +128,13 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         start = time.time()
         last_pub = 0.0
+        last_frame = start
         announced = False
+        # Se la camera dorme, 0x2345 non produce frame: NON restare appesi nella
+        # stessa sessione (la camera, risvegliata dopo, va agganciata con una
+        # sessione FRESCA). Riconnetti se non arriva nulla entro questi timeout.
+        NOFRAME_START = 25.0      # nessun primo frame → sessione stantia, riconnetti
+        NOFRAME_DROP = 30.0       # stream morto a metà → riconnetti
         try:
             while p.poll() is None and state.desired_on:
                 for pkt in session.run_video(1.0, ack_interval=1.0):
@@ -144,6 +150,7 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                         p.stdin.flush()
                     except (BrokenPipeError, OSError):
                         break
+                    last_frame = time.time()
                     state.note_frame()
                     if not announced:
                         state.update(status="streaming",
@@ -153,6 +160,12 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                 if now - last_pub >= heartbeat:   # keep-alive stato retained
                     state.publish()
                     last_pub = now
+                if not announced and now - start > NOFRAME_START:
+                    log.info("nessun frame entro %.0fs — riconnessione fresca", NOFRAME_START)
+                    break
+                if announced and now - last_frame > NOFRAME_DROP:
+                    log.warning("stream fermo da %.0fs — riconnessione", NOFRAME_DROP)
+                    break
                 if now - start > restart_every:
                     break
         finally:
@@ -161,6 +174,10 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
             except OSError:
                 pass
             p.wait()
+        # sessione senza frame → buttala, la prossima iterazione riconnette da zero
+        if not announced and session is not None:
+            session.close()
+            session = None
 
         if not state.desired_on:
             continue                      # transizione a OFF gestita in testa
