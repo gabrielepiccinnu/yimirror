@@ -374,6 +374,7 @@ class TnpSession:
         self.nonce_prefix = ""
         self.p2p_password = ""
         self.desired_on = True
+        self.devinfo: dict = {}
 
     def connect(self, timeout: float = 8.0) -> bool:
         """Sequenza ESATTA dal wire (§7u/§7v):
@@ -587,15 +588,17 @@ class TnpSession:
         return False
 
     def send_control(self, req_id: int, data: bytes,
-                     wait: float = 3.0) -> bytes | None:
+                     wait: float = 3.0, resp_id: int | None = None) -> bytes | None:
         """Invia UN controllo IOCTRL sulla sessione già connessa (NIENTE
         refresh 0x41→0x42) e attende la risposta 0xd0/d1 00 della camera.
 
         Verificato live (§7x): dopo la 0x42 la camera risponde ai controlli
-        direttamente, con commandType+1 (0x1300→0x1301, 0x1304→0x130c,
-        0x1311→0x1312). Il vecchio send_control_fresh rifaceva un handshake che
-        sul VPS falliva sempre ('refresh sessione FALLITO'), per cui nessun
-        controllo partiva mai. Usa un contatore di sessione self.ctrl crescente."""
+        direttamente. Il tipo di risposta è di norma commandType+1
+        (0x1300→0x1301, 0x0330→0x0331, 0x1311→0x1312), MA alcuni comandi
+        rispondono con un tipo dedicato: 0x1304 CLOSE_CAMERA → **0x130C**
+        (SMsgAVIoctrlDeviceInfoResp), non 0x1305. Per questi passare `resp_id`
+        esplicito, altrimenti la risposta reale viene scartata e il controllo
+        risulta 'senza risposta' (bug §7x-decies). Contatore self.ctrl crescente."""
         if not self.sock or not self.server:
             return None
         ctr = getattr(self, "ctrl", 0)
@@ -623,7 +626,8 @@ class TnpSession:
             self.sock.sendto(ack_control_0xd1(struct.unpack(">H", body[2:4])[0]),
                              self.server)
             rtype = struct.unpack(">H", body[12:14])[0]
-            if rtype == (req_id + 1) or rtype == 0xFFFF:
+            if (rtype == (req_id + 1) or (resp_id is not None and rtype == resp_id)
+                    or rtype == 0xFFFF):
                 resp = pkt
                 print(f"[ctrl] 0x{req_id:04x} -> type=0x{rtype:04x}")
                 if rtype != 0xFFFF:
@@ -709,7 +713,8 @@ class TnpSession:
         want = 0 if on else 1
         for attempt in range(1, retries + 1):
             resp = self.send_control(IOCTRL_CLOSE_CAMERA,
-                                     struct.pack(">I", want))
+                                     struct.pack(">I", want),
+                                     resp_id=IOCTRL_CLOSE_CAMERA_RESP)
             info = parse_devinfo(resp)
             if info is not None:
                 self.devinfo = info

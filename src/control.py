@@ -74,6 +74,12 @@ class ProxyState:
                 self.last_frame_ts = time.time()
         self.publish()
 
+    def note_frame(self) -> None:
+        """Marca l'arrivo di un frame SENZA pubblicare su MQTT (va chiamato ad
+        alta frequenza: lo stato retained lo aggiorna il publish periodico)."""
+        with self._lock:
+            self.last_frame_ts = time.time()
+
     def snapshot(self) -> dict:
         with self._lock:
             age = round(time.time() - self.last_frame_ts, 1) if self.last_frame_ts else None

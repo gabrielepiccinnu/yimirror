@@ -33,13 +33,38 @@ def live_view_active() -> bool:
     return "PlayerActivity" in out
 
 
+def _fresh_view_password(p2pid: str) -> str:
+    """viewPassword fresca dal cloud (§7x) se c'è l'account Yi; altrimenti
+    il valore statico YIMIRROR_P2P_PASSWORD. La viewPassword ruota a ogni
+    refresh device list dell'app: col cloud il proxy resta autonomo."""
+    acc = os.environ.get("YI_ACCOUNT", "")
+    pw = os.environ.get("YI_PASSWORD", "")
+    if acc and pw:
+        try:
+            from yi_client import YiClient
+            yc = YiClient(region=os.environ.get("YI_REGION", "eu"))
+            yc.login(acc, pw)
+            suffix = p2pid.split("-")[-1]
+            vp = yc.view_password_for(suffix)
+            if vp:
+                log.info("viewPassword dal cloud per '%s' (len %d)", suffix, len(vp))
+                return vp
+            log.warning("viewPassword non trovata nel cloud per '%s'", suffix)
+        except Exception as exc:
+            log.warning("recupero viewPassword dal cloud fallito: %s", exc)
+    return os.environ.get("YIMIRROR_P2P_PASSWORD", "")
+
+
 def push_native_loop(restart_every: float = 3600.0) -> None:
-    """Sessione TNP nativa → unwrap → pipe ffmpeg → RTSP (produzione, §7w)."""
+    """Macchina a stati: sessione TNP nativa → unwrap → pipe ffmpeg → RTSP
+    (produzione, §7w/§7y). Lo stato DESIDERATO (ON/OFF) arriva da Frigate via
+    MQTT o dall'API HTTP; OFF = privacy mode reale (CLOSE_CAMERA 0x1304)."""
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from tnp_client import TnpSession
     from tnp_proto import FrameReassembler, unwrap_frame
+    from control import ProxyState, start_mqtt, start_api
 
     p2pid = os.environ.get("YIMIRROR_P2PID", "")
     license_key = os.environ.get("YIMIRROR_LICENSE", "")
@@ -49,45 +74,63 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                   "YIMIRROR_INIT_STRING")
         raise SystemExit(1)
 
-    def fresh_view_password() -> str:
-        """viewPassword fresca dal cloud (§7x) se c'è l'account Yi; altrimenti
-        il valore statico YIMIRROR_P2P_PASSWORD. La viewPassword ruota a ogni
-        refresh device list dell'app: col cloud il proxy resta autonomo."""
-        acc = os.environ.get("YI_ACCOUNT", "")
-        pw = os.environ.get("YI_PASSWORD", "")
-        if acc and pw:
-            try:
-                from yi_client import YiClient
-                yc = YiClient(region=os.environ.get("YI_REGION", "eu"))
-                yc.login(acc, pw)
-                suffix = p2pid.split("-")[-1]
-                vp = yc.view_password_for(suffix)
-                if vp:
-                    log.info("viewPassword dal cloud per '%s' (len %d)", suffix, len(vp))
-                    return vp
-                log.warning("viewPassword non trovata nel cloud per '%s'", suffix)
-            except Exception as exc:
-                log.warning("recupero viewPassword dal cloud fallito: %s", exc)
-        return os.environ.get("YIMIRROR_P2P_PASSWORD", "")
+    state = ProxyState()
+    start_mqtt(state)
+    start_api(state)
 
-    session = TnpSession(p2pid, license_key, init_string)
-    reasm = FrameReassembler(password=os.environ.get("YIMIRROR_P2P_PASSWORD", ""))
+    session: TnpSession | None = None
+    heartbeat = 15.0                    # ripubblica lo stato retained ogni 15 s
+
+    def drop_session(power_off: bool) -> None:
+        nonlocal session
+        if session is None:
+            return
+        if power_off:
+            try:
+                session.set_camera_power(False)   # privacy mode reale
+            except Exception as exc:              # pragma: no cover
+                log.warning("spegnimento camera fallito: %s", exc)
+        session.close()
+        session = None
+
     while True:
-        if not session.connected:
+        # --- stato desiderato OFF → privacy mode, nessuna sessione ---------
+        if not state.desired_on:
+            if session is not None:
+                log.info("OFF richiesto → privacy mode + chiusura sessione")
+                drop_session(power_off=True)
+            cc = session.devinfo.get("close_camera") if session else 1
+            state.update(status="privacy", close_camera=cc)
+            state.wait_change(600)
+            continue
+
+        # --- stato desiderato ON → assicura sessione + video ---------------
+        if session is None or not session.connected:
+            state.update(status="waking")
             log.info("connessione TNP...")
+            session = TnpSession(p2pid, license_key, init_string)
+            session.desired_on = True
             if not session.connect(timeout=10):
                 log.warning("connect fallito — ritento tra 30 s")
-                time.sleep(30)
+                session = None
+                state.update(status="error")
+                state.wait_change(30)
                 continue
             log.info("sessione attiva: %s — apertura canale video", session.server)
-            session.start_video(password=fresh_view_password())
+            session.start_video(password=_fresh_view_password(p2pid))
             reasm = FrameReassembler(password=session.p2p_password)
+            state.update(server=str(session.server),
+                         close_camera=session.devinfo.get("close_camera"))
+
+        # --- pompa i frame verso ffmpeg finché resta ON --------------------
         cmd = ["ffmpeg", "-loglevel", "warning", "-f", "h264", "-i", "pipe:0",
                "-c", "copy", "-f", "rtsp", "-rtsp_transport", "tcp", RTSP_URL]
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         start = time.time()
+        last_pub = 0.0
+        announced = False
         try:
-            while p.poll() is None:
+            while p.poll() is None and state.desired_on:
                 for pkt in session.run_video(1.0, ack_interval=1.0):
                     vf = reasm.feed(pkt)
                     if vf is None:
@@ -101,7 +144,16 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                         p.stdin.flush()
                     except (BrokenPipeError, OSError):
                         break
-                if time.time() - start > restart_every:
+                    state.note_frame()
+                    if not announced:
+                        state.update(status="streaming",
+                                     close_camera=session.devinfo.get("close_camera"))
+                        announced = True
+                now = time.time()
+                if now - last_pub >= heartbeat:   # keep-alive stato retained
+                    state.publish()
+                    last_pub = now
+                if now - start > restart_every:
                     break
         finally:
             try:
@@ -109,7 +161,14 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
             except OSError:
                 pass
             p.wait()
-        log.warning("stream interrotto — riavvio immediato")
+
+        if not state.desired_on:
+            continue                      # transizione a OFF gestita in testa
+        # stream caduto ma ancora ON: la sessione può essere morta → riconnetto
+        log.warning("stream interrotto — riavvio")
+        state.update(status="waking")
+        if session is not None and not session.connected:
+            session = None
         time.sleep(2)
 
 
