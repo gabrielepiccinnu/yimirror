@@ -150,7 +150,7 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
         # con `-r` (opzione di INPUT, prima di `-i`): il demuxer h264 grezzo
         # assegna timestamp sequenziali (0, 1/fps, 2/fps, …) in ordine di
         # decodifica → DTS strettamente monotòni a prescindere dalle raffiche
-        # → stream fluido. `-fps_mode passthrough` tiene i frame così come sono.
+        # → stream fluido.
         fps = os.environ.get("YIMIRROR_FPS", "15")
         cmd = ["ffmpeg", "-loglevel", "warning",
                "-r", fps, "-f", "h264", "-i", "pipe:0",
@@ -160,6 +160,12 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
         last_pub = 0.0
         last_frame = start
         announced = False
+        # L'I-frame YI (unwrap → `00 00 00 01 67` = SPS+PPS+IDR) è l'UNICO frame
+        # che porta SPS/PPS: i P-frame no. Se ffmpeg riceve per primo un P-frame
+        # va in "non-existing PPS 0 / dimensions not set" e non apre l'output.
+        # → scarta i P-frame finché non è passato il primo keyframe di QUESTA
+        # sessione ffmpeg (seen_key si azzera a ogni (ri)avvio di ffmpeg).
+        seen_key = False
         # Se la camera dorme, 0x2345 non produce frame: NON restare appesi nella
         # stessa sessione (la camera, risvegliata dopo, va agganciata con una
         # sessione FRESCA). Riconnetti se non arriva nulla entro questi timeout.
@@ -175,6 +181,11 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                     reasm.frames.clear()
                     if not u:
                         continue
+                    if not seen_key:
+                        # aspetta il primo I-frame (SPS/PPS) prima di scrivere
+                        if not u.startswith(b"\x00\x00\x00\x01\x67"):
+                            continue
+                        seen_key = True
                     try:
                         p.stdin.write(u)
                         p.stdin.flush()
