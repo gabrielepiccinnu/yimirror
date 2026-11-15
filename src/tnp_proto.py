@@ -133,33 +133,70 @@ class FrameReassembler:
         self.big = big_endian
         self.wrapper = wrapper_len
         self.frames: list[VideoFrame] = []
-        self.stats = {"video": 0, "iframe": 0, "decrypted": 0, "audio": 0, "other": 0}
+        self.stats = {"video": 0, "iframe": 0, "decrypted": 0, "audio": 0,
+                      "other": 0, "partial_drop": 0}
+        self._part: dict | None = None   # frame frammentato in corso (§7x-undecies)
 
     def feed(self, udp_payload: bytes) -> VideoFrame | None:
+        """Riassembla i frame dai pacchetti 0xd0 (§7x-undecies).
+
+        Un frame inizia col pacchetto che porta il TNPFrameHead (codec 0x4E a
+        offset `wrapper`); la sua lunghezza TOTALE è nei 2 byte [10:12] del
+        sub-header. I frame piccoli (P, canale d1 03) stanno in un pacchetto; gli
+        I-frame (canale d1 02) sono FRAMMENTATI su ~38 pacchetti da ~1 KB: i
+        frammenti di continuazione NON hanno head e seguono con wseq consecutivo.
+        Ritorna un VideoFrame solo quando il frame è COMPLETO."""
         pkt = F1Packet.parse(udp_payload)
-        if pkt is None:
-            return None
-        if pkt.ftype != F1_DATA:
+        if pkt is None or pkt.ftype != F1_DATA:
             self.stats["other"] += 1
             return None
+        p = pkt.payload
         off = self.wrapper
-        if len(pkt.payload) < off + FRAME_HEAD_LEN:
-            self.stats["other"] += 1
+        if len(p) < 4:
             return None
-        head = FrameHead.parse(pkt.payload, off, self.big)
+        ch = p[1]                                   # 0x00 ctrl, 0x02 frag-video, 0x03 video
+        wseq = int.from_bytes(p[2:4], "big")
+        e = "big" if self.big else "little"
+        has_head = (len(p) >= off + FRAME_HEAD_LEN
+                    and int.from_bytes(p[off:off + 2], e) == CODEC_H264)
+        if has_head:
+            if self._part is not None:              # scarta un frammentato incompleto
+                self.stats["partial_drop"] += 1
+                self._part = None
+            head = FrameHead.parse(p, off, self.big)
+            total = int.from_bytes(p[10:12], e)     # lunghezza totale del frame payload
+            first = p[off:]                          # head(24) + primo chunk
+            if len(first) >= total:                  # completo in un pacchetto (P-frame)
+                return self._emit(head, bytes(first[:total]))
+            self._part = {"total": total, "buf": bytearray(first), "ch": ch,
+                          "next": (wseq + 1) & 0xFFFF, "head": head}
+            return None
+        # frammento di continuazione (niente head)
+        part = self._part
+        if part is not None and ch == part["ch"] and wseq == part["next"]:
+            part["buf"] += p[4:]                     # dati dopo `d1 0X <wseq>`
+            part["next"] = (wseq + 1) & 0xFFFF
+            if len(part["buf"]) >= part["total"]:
+                self._part = None
+                return self._emit(part["head"], bytes(part["buf"][:part["total"]]))
+            return None
+        self.stats["other"] += 1
+        return None
+
+    def _emit(self, head: "FrameHead", payload: bytes) -> VideoFrame | None:
+        """payload = TNPFrameHead(24 B) + NAL. Decifra l'I-frame e registra."""
         if head.codec_id != CODEC_H264:
             self.stats["audio" if head.codec_id in (0x00, 0x4F, 0x50) else "other"] += 1
             return None
-        buf = bytearray(pkt.payload[off:])
+        nal = bytearray(payload[FRAME_HEAD_LEN:])
         dec = False
         if head.is_iframe:
             self.stats["iframe"] += 1
-            # §7w: la regione cifrata = [4..36) del NAL (dopo l'head 24 B) —
-            # dentro ci sono SPS+PPS+inizio IDR in chiaro dopo il decrypt
-            dec = self.crypto.decrypt_iframe(buf, off=FRAME_HEAD_LEN)
+            # §7w: regione cifrata = [4..36) del NAL (dopo decrypt: SPS+PPS+inizio IDR)
+            dec = self.crypto.decrypt_iframe(nal, off=0)
             if dec:
                 self.stats["decrypted"] += 1
-        frame = VideoFrame(head=head, data=bytes(buf[FRAME_HEAD_LEN:]), raw=bytes(buf),
+        frame = VideoFrame(head=head, data=bytes(nal), raw=bytes(payload),
                            is_decrypted=dec)
         self.frames.append(frame)
         self.stats["video"] += 1
