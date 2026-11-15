@@ -169,10 +169,18 @@ class YiClient:
         firma delle API /v5 e /vas è `token + "&" + token_secret` (§7x,
         e9/d.s0 → e0.A()&e0.B()).
         """
-        import re
-        is_email = bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", account))
+        # d9/h.F (HttpClientV4): per l'internazionale (e8.d.M()==false, cioè
+        # regione != "CHN") il login usa SEMPRE il campo "account", mai "email"/
+        # "mobile" (quelli valgono solo per la Cina). Usare "email" per un indirizzo
+        # email fa fallire il server con code -10003.
+        region = os.environ.get("YI_REGION", "eu").upper()
         params = {"seq": "1"}
-        params["email" if is_email else "account"] = account
+        if region in ("CHN", "CN", "CHINA"):
+            import re
+            is_email = bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", account))
+            params["email" if is_email else "mobile"] = account
+        else:
+            params["account"] = account
         params["password"] = encrypt_login_password(password)
         params["dev_name"] = "docker-yimirror"
         params["dev_type"] = "yimirror"
