@@ -114,30 +114,49 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
     def backoff_wait() -> float:
         return min(BACKOFF_BASE * 2 ** max(fail_streak - 1, 0), BACKOFF_MAX)
 
-    def drop_session(power_off: bool) -> None:
-        nonlocal session
-        if session is None:
-            return
-        if power_off:
-            try:
-                session.set_camera_power(False)   # privacy mode reale
-            except Exception as exc:              # pragma: no cover
-                log.warning("spegnimento camera fallito: %s", exc)
-        session.close()
-        session = None
+    privacy_done = False               # privacy 0x1304 confermata (close_camera=1)
 
     while True:
-        # --- stato desiderato OFF → privacy mode, nessuna sessione ---------
+        # --- stato desiderato OFF → privacy REALE sulla camera (0x1304) -----
         if not state.desired_on:
-            if session is not None:
-                log.info("OFF richiesto → privacy mode + chiusura sessione")
-                drop_session(power_off=True)
-            cc = session.devinfo.get("close_camera") if session else 1
-            state.update(status="privacy", close_camera=cc)
+            # Spegnimento affidabile: ci si connette APPOSTA se serve, si manda
+            # 0x1304 e si VERIFICA close_camera=1 (prima si mandava solo se una
+            # sessione era già viva → con OFF a sessione chiusa la camera restava
+            # accesa). Un flag evita di ripetere; se fallisce, backoff.
+            if not privacy_done:
+                try:
+                    if session is None or not session.connected:
+                        log.info("OFF richiesto → connessione per privacy...")
+                        session = TnpSession(p2pid, license_key, init_string)
+                        session.desired_on = False
+                        if not session.connect(timeout=10):
+                            session = None
+                            raise RuntimeError("connect per privacy fallito")
+                    session.p2p_password = _fresh_view_password(p2pid)
+                    ok = session.set_camera_power(False)   # privacy mode reale
+                    cc = session.devinfo.get("close_camera")
+                    session.close()
+                    session = None
+                    if not ok:
+                        raise RuntimeError(f"0x1304 non confermato (close_camera={cc})")
+                    privacy_done = True
+                    fail_streak = 0
+                    log.info("privacy applicata: camera spenta (close_camera=%s)", cc)
+                except Exception as exc:
+                    fail_streak += 1
+                    wait = backoff_wait()
+                    log.warning("privacy OFF non applicata: %s — ritento tra %.0fs",
+                                exc, wait)
+                    session = None
+                    state.update(status="error")
+                    state.wait_change(wait)
+                    continue
+            state.update(status="privacy", close_camera=1)
             state.wait_change(600)
             continue
 
         # --- stato desiderato ON → assicura sessione + video ---------------
+        privacy_done = False           # alla prossima OFF si riapplica privacy
         if session is None or not session.connected:
             state.update(status="waking")
             log.info("connessione TNP...")
