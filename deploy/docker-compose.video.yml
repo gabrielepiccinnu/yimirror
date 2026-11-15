@@ -1,0 +1,83 @@
+# Proxy video + Frigate + broker MQTT interno (unico progetto compose sul VPS).
+# - mediamtx: server RTSP; il dispositivo di casa PUSHA lo stream (auth obbligatoria)
+# - frigate: legge da mediamtx (rete interna), registra 24/7 (retention 7g), UI su 8971
+# - mosquitto: broker MQTT SOLO su rete interna (nessuna porta pubblica) per on/off
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: yimirror-video2
+    restart: unless-stopped
+    ports:
+      - "8554:8554"
+    environment:
+      - TZ=${TZ:-Europe/Rome}
+      - MTX_AUTHINTERNALUSERS=${RTSP_USER}:${RTSP_PASS}
+      - MTX_PATHS_INGRESSO_SOURCE=publisher
+      - MTX_HLS=true
+      - MTX_HLSADDRESS=:8888
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: yimirror-mosquitto2
+    restart: unless-stopped
+    configs:
+      - source: mosquitto_conf
+        target: /mosquitto/config/mosquitto.conf
+
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    container_name: yimirror-frigate2
+    restart: unless-stopped
+    shm_size: "256mb"
+    ports:
+      - "8971:8971"
+    environment:
+      - TZ=${TZ:-Europe/Rome}
+      - FRIGATE_RTSP_PASSWORD=${RTSP_PASS}
+      - YIMIRROR_RELOAD=3
+    volumes:
+      - frigate-data:/media/frigate
+      - frigate-config:/config
+    configs:
+      - source: frigate_conf
+        target: /config/config.yml
+    depends_on:
+      - mediamtx
+      - mosquitto
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: yimirror-cf2
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CF_TUNNEL_TOKEN}"]
+
+configs:
+  mosquitto_conf:
+    content: |
+      listener 1883
+      allow_anonymous true
+      persistence false
+  frigate_conf:
+    content: |
+      mqtt:
+        enabled: true
+        host: mosquitto
+        port: 1883
+
+      cameras:
+        ingresso:
+          enabled: true
+          ffmpeg:
+            inputs:
+              - path: rtsp://bridge:{FRIGATE_RTSP_PASSWORD}@mediamtx:8554/ingresso
+                roles:
+                  - record
+          record:
+            enabled: true
+            retain:
+              days: 7
+              mode: all
+
+volumes:
+  frigate-data:
+  frigate-config:

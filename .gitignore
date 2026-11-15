@@ -5,3 +5,4 @@ data/
 data-test/
 deploy/.env.dokploy
 deploy/yimirror-image.tar
+deploy/.frigate-creds.env
