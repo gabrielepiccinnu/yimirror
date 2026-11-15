@@ -101,6 +101,18 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
 
     session: TnpSession | None = None
     heartbeat = 15.0                    # ripubblica lo stato retained ogni 15 s
+    # Anti-mute del relay (§7x-bis): a mutare l'IP è lo SPAM di handshake+wake,
+    # non i resend su sessione calda. Quindi NON si ricostruisce la sessione a
+    # ogni buco: la si tiene calda (run_video ri-triggera 0x2345 a caldo ogni ~4s
+    # + keepalive) e si fa un vero re-handshake SOLO dopo REHANDSHAKE_AFTER di 0
+    # frame, con backoff esponenziale tra i tentativi falliti.
+    REHANDSHAKE_AFTER = float(os.environ.get("YIMIRROR_REHANDSHAKE_AFTER", "120"))
+    BACKOFF_BASE = float(os.environ.get("YIMIRROR_BACKOFF_BASE", "60"))
+    BACKOFF_MAX = float(os.environ.get("YIMIRROR_BACKOFF_MAX", "300"))
+    fail_streak = 0                    # reconnect consecutivi senza frame (→ backoff)
+
+    def backoff_wait() -> float:
+        return min(BACKOFF_BASE * 2 ** max(fail_streak - 1, 0), BACKOFF_MAX)
 
     def drop_session(power_off: bool) -> None:
         nonlocal session
@@ -132,10 +144,12 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
             session = TnpSession(p2pid, license_key, init_string)
             session.desired_on = True
             if not session.connect(timeout=10):
-                log.warning("connect fallito — ritento tra 30 s")
+                fail_streak += 1
+                wait = backoff_wait()
+                log.warning("connect fallito — backoff %.0fs (tentativo %d)", wait, fail_streak)
                 session = None
                 state.update(status="error")
-                state.wait_change(30)
+                state.wait_change(wait)
                 continue
             log.info("sessione attiva: %s — apertura canale video", session.server)
             session.start_video(password=_fresh_view_password(p2pid))
@@ -166,10 +180,10 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
         # → scarta i P-frame finché non è passato il primo keyframe di QUESTA
         # sessione ffmpeg (seen_key si azzera a ogni (ri)avvio di ffmpeg).
         seen_key = False
-        # Se la camera dorme, 0x2345 non produce frame: NON restare appesi nella
-        # stessa sessione (la camera, risvegliata dopo, va agganciata con una
-        # sessione FRESCA). Riconnetti se non arriva nulla entro questi timeout.
-        NOFRAME_START = 25.0      # nessun primo frame → sessione stantia, riconnetti
+        # Niente frame: si TIENE la sessione calda (run_video ri-triggera 0x2345 a
+        # caldo + keepalive) e si re-handshaka solo dopo REHANDSHAKE_AFTER, per non
+        # martellare il relay (§7x-bis). NOFRAME_DROP resta breve: se lo stream era
+        # partito e cade, la sessione è morta → riconnetti presto.
         NOFRAME_DROP = 30.0       # stream morto a metà → riconnetti
         try:
             # UNA sola chiamata lunga al generatore (NON in un loop a 1s, che
@@ -202,8 +216,9 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                 if now - last_pub >= heartbeat:   # keep-alive stato retained
                     state.publish()
                     last_pub = now
-                if not announced and now - start > NOFRAME_START:
-                    log.info("nessun frame entro %.0fs — riconnessione fresca", NOFRAME_START)
+                if not announced and now - start > REHANDSHAKE_AFTER:
+                    log.info("nessun frame entro %.0fs su sessione calda — re-handshake",
+                             REHANDSHAKE_AFTER)
                     break
                 if announced and now - last_frame > NOFRAME_DROP:
                     log.warning("stream fermo da %.0fs — riconnessione", NOFRAME_DROP)
@@ -214,19 +229,30 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
             except OSError:
                 pass
             p.wait()
-        # sessione senza frame → buttala, la prossima iterazione riconnette da zero
-        if not announced and session is not None:
-            session.close()
-            session = None
-
         if not state.desired_on:
-            continue                      # transizione a OFF gestita in testa
-        # stream caduto ma ancora ON: la sessione può essere morta → riconnetto
-        log.warning("stream interrotto — riavvio")
-        state.update(status="waking")
-        if session is not None and not session.connected:
-            session = None
-        time.sleep(2)
+            continue                      # transizione a OFF (privacy) gestita in testa
+        if announced:
+            # avevamo frame → nessun mute: azzera il backoff, riconnetti presto.
+            # Se la sessione regge (solo ffmpeg caduto) la si tiene calda.
+            fail_streak = 0
+            log.warning("stream interrotto — riavvio")
+            state.update(status="waking")
+            if session is not None and not session.connected:
+                session.close()
+                session = None
+            time.sleep(2)
+        else:
+            # 0 frame dopo REHANDSHAKE_AFTER su sessione calda: probabile relay muto
+            # o camera che non streamma → butta la sessione e re-handshaka con
+            # backoff crescente (non martellare il relay, §7x-bis).
+            fail_streak += 1
+            wait = backoff_wait()
+            if session is not None:
+                session.close()
+                session = None
+            log.warning("0 frame — re-handshake tra %.0fs (tentativo %d)", wait, fail_streak)
+            state.update(status="waking")
+            state.wait_change(wait)
 
 
 def main() -> None:
