@@ -34,24 +34,45 @@ def live_view_active() -> bool:
 
 
 def _fresh_view_password(p2pid: str) -> str:
-    """viewPassword fresca dal cloud (§7x) se c'è l'account Yi; altrimenti
-    il valore statico YIMIRROR_P2P_PASSWORD. La viewPassword ruota a ogni
-    refresh device list dell'app: col cloud il proxy resta autonomo."""
+    """viewPassword SEMPRE fresca dal cloud (§7x-terdecies). La viewPassword
+    ruota a ogni refresh della device list dell'app: rileggendola dal cloud a
+    ogni riconnessione il proxy resta autonomo e immune alla rotazione.
+
+    Fonte primaria: sessione adottata via `YI_TOKEN`/`YI_TOKEN_SECRET`/`YI_USERID`
+    (la firma /v5 usa `token&token_secret`, HmacSHA1). Il login diretto
+    `/v4/users/login` dà -10003 (social/anti-bot), quindi si usa il token della
+    sessione già autenticata. Fallback: login (se un giorno sbloccato) → statica
+    `YIMIRROR_P2P_PASSWORD`."""
+    suffix = p2pid.split("-")[-1]
+    region = os.environ.get("YI_REGION", "eu")
+    token = os.environ.get("YI_TOKEN", "")
+    secret = os.environ.get("YI_TOKEN_SECRET", "")
+    userid = os.environ.get("YI_USERID", "")
+    if token and secret:
+        try:
+            from yi_client import YiClient
+            yc = YiClient(region=region)
+            yc.adopt_token(token, userid=userid or None, token_secret=secret)
+            vp = yc.view_password_for(suffix)
+            if vp:
+                log.info("viewPassword dal cloud (token) per '%s' (len %d)", suffix, len(vp))
+                return vp
+            log.warning("viewPassword non trovata nel cloud (token) per '%s'", suffix)
+        except Exception as exc:
+            log.warning("recupero viewPassword via token fallito: %s", exc)
     acc = os.environ.get("YI_ACCOUNT", "")
     pw = os.environ.get("YI_PASSWORD", "")
     if acc and pw:
         try:
             from yi_client import YiClient
-            yc = YiClient(region=os.environ.get("YI_REGION", "eu"))
+            yc = YiClient(region=region)
             yc.login(acc, pw)
-            suffix = p2pid.split("-")[-1]
             vp = yc.view_password_for(suffix)
             if vp:
-                log.info("viewPassword dal cloud per '%s' (len %d)", suffix, len(vp))
+                log.info("viewPassword dal cloud (login) per '%s' (len %d)", suffix, len(vp))
                 return vp
-            log.warning("viewPassword non trovata nel cloud per '%s'", suffix)
         except Exception as exc:
-            log.warning("recupero viewPassword dal cloud fallito: %s", exc)
+            log.warning("login cloud fallito: %s", exc)
     return os.environ.get("YIMIRROR_P2P_PASSWORD", "")
 
 
