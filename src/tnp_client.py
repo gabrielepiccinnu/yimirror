@@ -512,38 +512,15 @@ class TnpSession:
             if pkt[:2] == b"\xf1\xe0":
                 self.sock.sendto(b"\xf1\xe1\x00\x00", self.server)
         # controlli DIRETTI sulla sessione connessa (§7x: niente refresh
-        # 0x41→0x42 per controllo — era la causa del 'refresh sessione FALLITO'
-        # che bloccava tutto sul VPS). Prima DEVINFO per leggere close_camera;
-        # se la camera è in privacy mode (close_camera=1) la riaccende; poi la
-        # sequenza di avvio video (TRIGGER_SYNC → SET_RESOLUTION = il trigger).
-        # Ordine ESATTO del cold-start dell'app (tap.pcap, §7x-ter):
-        # 1300 → 03c0 (DEVE tornare 03c1 REALE: è il sync col server YI, il vero
-        # gate — se resta ffff la camera non avvia l'encoding) → 1311
-        # SET_RESOLUTION con useCount incrementale (l'app manda 1312 ×2) = trigger
-        # dei frame. NIENTE 0x2345 (è del flusso PlayerActivity, non del cold-start).
+        # 0x41→0x42 per controllo). Sequenza di avvio video VERIFICATA DAL VIVO
+        # (§7x-novies, 15/11): 1300 (UPDATE_CHECK_PHONE) → DEVINFO per leggere
+        # close_camera (privacy) → **0x2345 START_REALTIME con data 01020100**:
+        # È QUESTO il trigger dei frame (il video parte subito dopo), NON 0x1311
+        # né 0x03c0 (quelli rispondono ma non avviano l'encoding). La viewPassword
+        # DEVE essere fresca o l'authInfo dei controlli è rifiutato (ffff).
         ok = False
         self.send_control(IOCTRL_UPDATE_CHECK_PHONE, b"\x00" * 4)
-        # TRIGGER_SYNC con retry finché reale (l'app lo manda presto e riprova)
-        synced = False
-        for _ in range(5):
-            resp = self.send_control(IOCTRL_TRIGGER_SYNC, b"\x00\x00\x00\x01", wait=2.0)
-            rt = ctrl_response_type(resp)
-            if rt is not None and rt != 0xFFFF:
-                synced = True
-                ok = True
-                break
-            time.sleep(1.0)
-        print(f"[sync] TRIGGER_SYNC reale: {synced}")
-        # SET_RESOLUTION ×2 con useCount incrementale = trigger dei frame
-        self.use_count = getattr(self, "use_count", 0)
-        for _ in range(2):
-            self.use_count += 1
-            data = b"\x00\x00\x00\x02" + struct.pack(">I", self.use_count)
-            resp = self.send_control(IOCTRL_SET_RESOLUTION, data, wait=2.0)
-            if resp is not None and ctrl_response_type(resp) != 0xFFFF:
-                ok = True
-            time.sleep(0.2)
-        # DEVINFO per close_camera (privacy mode) — dopo il trigger
+        # DEVINFO per close_camera (privacy mode) — se spenta la riaccendo
         info = parse_devinfo(self.send_control(IOCTRL_DEVINFO_REQ, b"\x00" * 4))
         if info is not None:
             self.devinfo = info
@@ -552,9 +529,12 @@ class TnpSession:
             if info["close_camera"] == 1 and self.desired_on:
                 print("[power] camera in privacy mode → riaccendo")
                 self.set_camera_power(True)
-                self.use_count += 1
-                self.send_control(IOCTRL_SET_RESOLUTION,
-                                  b"\x00\x00\x00\x02" + struct.pack(">I", self.use_count))
+        # START_REALTIME = il trigger del video
+        resp = self.send_control(IOCTRL_START_REALTIME,
+                                 bytes.fromhex("01020100"), wait=2.0)
+        rt = ctrl_response_type(resp)
+        ok = rt is None or rt != 0xFFFF   # il 2345 spesso non risponde: il video parte
+        print(f"[video] START_REALTIME inviato (resp={rt})")
         return ok
 
     def rehandshake(self, timeout: float = 8.0) -> bool:
@@ -823,32 +803,14 @@ class TnpSession:
                     except OSError:
                         pass
                 last_check = now
-            # FLOOD handshake durante il cold-start (come l'app, §7x-quater):
-            # è ciò che sveglia la camera fredda. ~5/s finché non arrivano frame.
-            if not frames and now - last_hs >= 0.2:
-                self._hs_flood()
-                last_hs = now
-            if (not frames and now - last_start >= _RETRY_INTERVAL
+            # Finché non arrivano frame: ri-triggero il video con START_REALTIME
+            # (§7x-novies). NIENTE flood handshake / 0xf0 reset / SET_RESOLUTION:
+            # reallocano il rendezvous (§7x-septies) o azzerano la sessione sana.
+            # La sessione resta valida (controlli OK); basta ripetere il 0x2345.
+            if (not frames and now - last_start >= 3.0
                     and hasattr(self, "p2p_password")):
-                # finché non arrivano frame: ritento l'avvio stream a ritmo
-                # MODERATO (default 30 s, era 11 s) — alternanza TRIGGER_SYNC /
-                # SET_RESOLUTION. Il wake 0x1a è costoso e irrita il relay:
-                # lo rifaccio solo ogni _WAKE_INTERVAL (default 90 s). §7x-bis.
-                self._retry_n = getattr(self, "_retry_n", 0)
-                self._retry_n += 1
-                if self._retry_n % 2:
-                    self.send_control(IOCTRL_TRIGGER_SYNC, b"\x00\x00\x00\x01", wait=2.0)
-                else:
-                    self.use_count = getattr(self, "use_count", 0) + 1
-                    self.send_control(
-                        IOCTRL_SET_RESOLUTION,
-                        b"\x00\x00\x00\x02" + struct.pack(">I", self.use_count),
-                        wait=2.0)
-                if now - last_wake >= _WAKE_INTERVAL:
-                    wake_device(self.p2pid, self.license, self.servers,
-                                timeout=3.0)
-                    last_wake = now
-                self.sock.sendto(b"\xf1\xf0\x00\x00", self.server)
+                self.send_control(IOCTRL_START_REALTIME,
+                                  bytes.fromhex("01020100"), wait=0.0)
                 last_start = now
             try:
                 data, _ = self.sock.recvfrom(65535)
