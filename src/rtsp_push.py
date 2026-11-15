@@ -144,16 +144,16 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                          close_camera=session.devinfo.get("close_camera"))
 
         # --- pompa i frame verso ffmpeg finché resta ON --------------------
-        # I frame arrivano dal P2P a raffica e senza timestamp: con `-f h264`
-        # grezzo ffmpeg genera DTS che si accavallano (Non-monotonic DTS) →
-        # Frigate vede un fermo immagine. `-use_wallclock_as_timestamps 1`
-        # assegna a ogni pacchetto il PTS del wall-clock al momento della
-        # lettura dal pipe (i frame sono scritti in tempo reale) → DTS monotòni
-        # e stream fluido. `+genpts` completa i PTS mancanti.
+        # I frame arrivano dal P2P a raffica e senza timestamp. Il wall-clock
+        # NON basta (frame della stessa raffica → timestamp identici → DTS
+        # all'indietro → Frigate resta fermo). Si FORZA il framerate d'ingresso
+        # con `-r` (opzione di INPUT, prima di `-i`): il demuxer h264 grezzo
+        # assegna timestamp sequenziali (0, 1/fps, 2/fps, …) in ordine di
+        # decodifica → DTS strettamente monotòni a prescindere dalle raffiche
+        # → stream fluido. `-fps_mode passthrough` tiene i frame così come sono.
+        fps = os.environ.get("YIMIRROR_FPS", "15")
         cmd = ["ffmpeg", "-loglevel", "warning",
-               "-fflags", "+genpts",
-               "-use_wallclock_as_timestamps", "1",
-               "-f", "h264", "-i", "pipe:0",
+               "-r", fps, "-f", "h264", "-i", "pipe:0",
                "-c", "copy", "-f", "rtsp", "-rtsp_transport", "tcp", RTSP_URL]
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         start = time.time()
