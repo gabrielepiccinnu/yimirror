@@ -44,6 +44,9 @@ P2P_PORT = 32100
 _RETRY_INTERVAL = float(os.environ.get("YIMIRROR_RETRY_INTERVAL", "2"))
 _WAKE_INTERVAL = float(os.environ.get("YIMIRROR_WAKE_INTERVAL", "60"))
 _CHECK_INTERVAL = float(os.environ.get("YIMIRROR_CHECK_INTERVAL", "5"))
+# Ri-trigger di START_REALTIME (0x2345) SOLO dopo questo gap senza frame: mai
+# mentre lo stream scorre, o la camera riparte in continuazione e non si sostiene.
+_RETRIGGER_AFTER = float(os.environ.get("YIMIRROR_RETRIGGER_AFTER", "4"))
 
 MSG_DEV_ONLINE_ACK = 0x19
 MSG_HELLO = 0x00
@@ -788,7 +791,10 @@ class TnpSession:
         last_check = 0.0
         last_wake = 0.0
         last_hs = 0.0
-        self.video_seq = 0
+        if not hasattr(self, "video_seq"):
+            self.video_seq = 0            # ack-counter PERSISTENTE tra le chiamate
+        if not hasattr(self, "_last_vframe"):
+            self._last_vframe = 0.0        # ultimo frame video ricevuto (persistente)
         self.sock.settimeout(0.2)
         while time.time() - start < seconds:
             now = time.time()
@@ -808,11 +814,14 @@ class TnpSession:
                     except OSError:
                         pass
                 last_check = now
-            # Finché non arrivano frame: ri-triggero il video con START_REALTIME
-            # (§7x-novies). NIENTE flood handshake / 0xf0 reset / SET_RESOLUTION:
-            # reallocano il rendezvous (§7x-septies) o azzerano la sessione sana.
-            # La sessione resta valida (controlli OK); basta ripetere il 0x2345.
-            if (not frames and now - last_start >= 3.0
+            # Ri-triggero il video con START_REALTIME SOLO se non arrivano frame
+            # da >_RETRIGGER s (§7x-novies). FONDAMENTALE: NON ri-mandarlo mentre
+            # lo stream scorre — ri-triggerare di continuo fa ripartire l'encoder
+            # della camera e lo stream non si sostiene mai (usavamo `not frames`,
+            # ma `frames` si azzera a ogni chiamata → 0x2345 ~1/s anche streammando).
+            # Ora il timer è persistente sulla sessione (_last_vframe). NIENTE
+            # flood handshake / 0xf0 / SET_RESOLUTION: resettano la sessione sana.
+            if (now - self._last_vframe > _RETRIGGER_AFTER and now - last_start >= 3.0
                     and hasattr(self, "p2p_password")):
                 self.send_control(IOCTRL_START_REALTIME,
                                   bytes.fromhex("01020100"), wait=0.0)
@@ -851,6 +860,7 @@ class TnpSession:
                 elif body[:2] in (b"\xd1\x02", b"\xd1\x03"):
                     seq = struct.unpack(">H", body[2:4])[0]
                     self.sock.sendto(ack_video_0xd1(seq), self.server)
+                    self._last_vframe = now       # stream vivo → non ri-triggerare
                     frames.append(data)
             elif verbose and data[1] != MSG_ALIVE_ACK:
                 print(f"  <- tipo 0x{data[1]:02x} len={len(data)} {data[:28].hex()}")
