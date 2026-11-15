@@ -47,6 +47,8 @@ _CHECK_INTERVAL = float(os.environ.get("YIMIRROR_CHECK_INTERVAL", "5"))
 # Ri-trigger di START_REALTIME (0x2345) SOLO dopo questo gap senza frame: mai
 # mentre lo stream scorre, o la camera riparte in continuazione e non si sostiene.
 _RETRIGGER_AFTER = float(os.environ.get("YIMIRROR_RETRIGGER_AFTER", "4"))
+# TRIGGER_SYNC 0x03c0 periodico durante lo stream (l'app lo manda ~ogni 10s, §7w).
+_SYNC_INTERVAL = float(os.environ.get("YIMIRROR_SYNC_INTERVAL", "10"))
 
 MSG_DEV_ONLINE_ACK = 0x19
 MSG_HELLO = 0x00
@@ -775,22 +777,26 @@ class TnpSession:
                 pass
 
     def run_video(self, seconds: float, ack_interval: float = 1.0,
-                  verbose: bool = False) -> list[bytes]:
-        """Loop di ricezione post-start_video: risponde alle risposte di
-        controllo (ack d1 00 <ctr+1>), ack-a i frame dati con la seq del
-        wrapper (d1 03), risponde agli heartbeat e0 con e1, e mantiene un ack
-        ritmico d103 con contatore proprio (come l'app nel pcap)."""
+                  verbose: bool = False):
+        """GENERATORE a chiamata unica (una per sessione): emette ogni pacchetto
+        video `0xD0` (d1 02/d1 03) APPENA arriva (`yield data`), e `yield None` sui
+        tick di housekeeping (timeout socket / e0 / f0 / 0x40 / d1 00). Mantiene:
+        ack ritmico d103 (contatore proprio, come l'app), ack per-pacchetto con
+        echo del wseq, heartbeat e0, risposta a e0/f0 e ai re-invito 0x40/0x41,
+        check-online 0x18 ogni _CHECK_INTERVAL, TRIGGER_SYNC 0x03c0 ogni
+        _SYNC_INTERVAL (come l'app), e ri-trigger 0x2345 SOLO dopo un gap frame.
+
+        CRUCIALE: va chiamata UNA volta sola per sessione (non in un loop a 1s):
+        i timer locali sono per-chiamata, quindi una chiamata lunga garantisce le
+        cadenze corrette (0x18 ogni 5s, non ~1/s → niente rate-limit/mute del
+        relay §7x-bis, che è ciò che fermava lo stream dopo pochi secondi)."""
         if not self.sock:
-            return []
-        frames: list[bytes] = []
+            return
         start = time.time()
         last_ack = 0.0
         last_sync = 0.0
         last_start = 0.0
-        last_refresh = 0.0
         last_check = 0.0
-        last_wake = 0.0
-        last_hs = 0.0
         if not hasattr(self, "video_seq"):
             self.video_seq = 0            # ack-counter PERSISTENTE tra le chiamate
         if not hasattr(self, "_last_vframe"):
@@ -814,13 +820,17 @@ class TnpSession:
                     except OSError:
                         pass
                 last_check = now
+            # TRIGGER_SYNC 0x03c0 periodico: l'app lo ri-manda ~ogni 10s mentre
+            # lo stream scorre (§7w). Fire-and-forget, come fa l'app.
+            if (now - last_sync >= _SYNC_INTERVAL and hasattr(self, "p2p_password")):
+                self.send_control(IOCTRL_TRIGGER_SYNC, b"\x00" * 4, wait=0.0)
+                last_sync = now
             # Ri-triggero il video con START_REALTIME SOLO se non arrivano frame
             # da >_RETRIGGER s (§7x-novies). FONDAMENTALE: NON ri-mandarlo mentre
             # lo stream scorre — ri-triggerare di continuo fa ripartire l'encoder
-            # della camera e lo stream non si sostiene mai (usavamo `not frames`,
-            # ma `frames` si azzera a ogni chiamata → 0x2345 ~1/s anche streammando).
-            # Ora il timer è persistente sulla sessione (_last_vframe). NIENTE
-            # flood handshake / 0xf0 / SET_RESOLUTION: resettano la sessione sana.
+            # della camera e lo stream non si sostiene mai. Il timer è persistente
+            # sulla sessione (_last_vframe). NIENTE flood/0xf0/SET_RESOLUTION:
+            # resettano la sessione sana.
             if (now - self._last_vframe > _RETRIGGER_AFTER and now - last_start >= 3.0
                     and hasattr(self, "p2p_password")):
                 self.send_control(IOCTRL_START_REALTIME,
@@ -829,14 +839,18 @@ class TnpSession:
             try:
                 data, _ = self.sock.recvfrom(65535)
             except socket.timeout:
+                yield None                    # tick: il chiamante fa housekeeping
                 continue
             if len(data) < 4 or data[0] != 0xF1:
+                yield None
                 continue
             if data[1] == MSG_ALIVE:
                 self.sock.sendto(b"\xf1\xe1\x00\x00", self.server)
+                yield None
                 continue
             if data[1] == 0xF0:
                 self.sock.sendto(b"\xf1\xf0\x00\x00", self.server)
+                yield None
                 continue
             if data[1] in (MSG_CHALLENGE, MSG_CONNECT):  # 0x40 re-invito / 0x41 relay
                 # §7x-quater: quando la camera esce dallo sleep RE-INVITA con 0x40;
@@ -847,8 +861,10 @@ class TnpSession:
                 r41 = build_connect_response(self.p2pid, self.license,
                                              b"", ts=int(time.time()))[4:]
                 self.sock.sendto(header(MSG_CONNECT, len(r41)) + r41, tgt)
+                yield None
                 continue
             if data[1] == 0x42:  # 0x42: sessione (ri)confermata
+                yield None
                 continue
             if data[1] == 0xD0:
                 body = data[4:]
@@ -857,14 +873,24 @@ class TnpSession:
                 if body[:2] == b"\xd1\x00":
                     ctr = struct.unpack(">H", body[2:4])[0]
                     self.sock.sendto(ack_control_0xd1(ctr), self.server)
+                    yield None
                 elif body[:2] in (b"\xd1\x02", b"\xd1\x03"):
                     seq = struct.unpack(">H", body[2:4])[0]
                     self.sock.sendto(ack_video_0xd1(seq), self.server)
                     self._last_vframe = now       # stream vivo → non ri-triggerare
-                    frames.append(data)
-            elif verbose and data[1] != MSG_ALIVE_ACK:
-                print(f"  <- tipo 0x{data[1]:02x} len={len(data)} {data[:28].hex()}")
-        return frames
+                    yield data                    # emetti il frame SUBITO
+                else:
+                    yield None
+            else:
+                if verbose and data[1] != MSG_ALIVE_ACK:
+                    print(f"  <- tipo 0x{data[1]:02x} len={len(data)} {data[:28].hex()}")
+                yield None
+
+    def run_video_collect(self, seconds: float, ack_interval: float = 1.0,
+                          verbose: bool = False) -> list[bytes]:
+        """Wrapper a lista del generatore run_video (per test/one-shot)."""
+        return [p for p in self.run_video(seconds, ack_interval, verbose)
+                if p is not None]
 
 
 if __name__ == "__main__":

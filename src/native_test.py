@@ -69,7 +69,7 @@ def main() -> None:
     started = s.start_video()
     print("risposta relay ai controlli:", started)
     print(f"ascolto {args.seconds:.0f} s...")
-    frames = s.run_video(args.seconds, ack_interval=1.0, verbose=True)
+    frames = s.run_video_collect(args.seconds, ack_interval=1.0, verbose=True)
     print(f"frame 0xd0 ricevuti: {len(frames)}")
     if frames:
         reasm = FrameReassembler(password=s.p2p_password)

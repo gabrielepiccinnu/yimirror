@@ -172,31 +172,32 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
         NOFRAME_START = 25.0      # nessun primo frame → sessione stantia, riconnetti
         NOFRAME_DROP = 30.0       # stream morto a metà → riconnetti
         try:
-            while p.poll() is None and state.desired_on:
-                for pkt in session.run_video(1.0, ack_interval=1.0):
+            # UNA sola chiamata lunga al generatore (NON in un loop a 1s, che
+            # azzererebbe i timer interni → check-online 0x18 ~1/s → mute del
+            # relay §7x-bis). Il generatore emette i frame appena arrivano
+            # (fluidità) e `None` sui tick di housekeeping.
+            for pkt in session.run_video(restart_every, ack_interval=1.0):
+                if p.poll() is not None or not state.desired_on:
+                    break
+                if pkt is not None:
                     vf = reasm.feed(pkt)
-                    if vf is None:
-                        continue
-                    u = unwrap_frame(vf)
-                    reasm.frames.clear()
-                    if not u:
-                        continue
-                    if not seen_key:
-                        # aspetta il primo I-frame (SPS/PPS) prima di scrivere
-                        if not u.startswith(b"\x00\x00\x00\x01\x67"):
-                            continue
-                        seen_key = True
-                    try:
-                        p.stdin.write(u)
-                        p.stdin.flush()
-                    except (BrokenPipeError, OSError):
-                        break
-                    last_frame = time.time()
-                    state.note_frame()
-                    if not announced:
-                        state.update(status="streaming",
-                                     close_camera=session.devinfo.get("close_camera"))
-                        announced = True
+                    if vf is not None:
+                        u = unwrap_frame(vf)
+                        reasm.frames.clear()
+                        # gate keyframe: scrivi solo dopo il primo I-frame (SPS/PPS)
+                        if u and (seen_key or u.startswith(b"\x00\x00\x00\x01\x67")):
+                            seen_key = True
+                            try:
+                                p.stdin.write(u)
+                                p.stdin.flush()
+                            except (BrokenPipeError, OSError):
+                                break
+                            last_frame = time.time()
+                            state.note_frame()
+                            if not announced:
+                                state.update(status="streaming",
+                                             close_camera=session.devinfo.get("close_camera"))
+                                announced = True
                 now = time.time()
                 if now - last_pub >= heartbeat:   # keep-alive stato retained
                     state.publish()
@@ -206,8 +207,6 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                     break
                 if announced and now - last_frame > NOFRAME_DROP:
                     log.warning("stream fermo da %.0fs — riconnessione", NOFRAME_DROP)
-                    break
-                if now - start > restart_every:
                     break
         finally:
             try:

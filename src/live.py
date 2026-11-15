@@ -210,7 +210,7 @@ def main() -> None:
                 session.start_video()
             idle = time.time()
             while time.time() - start < args.seconds:
-                got = session.run_video(1.0, ack_interval=1.0)
+                got = session.run_video_collect(1.0, ack_interval=1.0)
                 for pkt in got:
                     reasm.feed(pkt)
                 if got:
