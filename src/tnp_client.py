@@ -274,6 +274,27 @@ IOCTRL_DEVINFO_RESP = 0x0331          # DEVINFO_RESP (817): SMsgAVIoctrlDeviceIn
 IOCTRL_CLOSE_CAMERA = 0x1304          # IOTYPE_USER_IPCAM_CLOSE_CAMERA_REQ (4868)
 IOCTRL_CLOSE_CAMERA_RESP = 0x130C     # IOTYPE_USER_IPCAM_CLOSE_CAMERA_RESP (4876)
 
+# ---- Famiglia RTMP = motore della registrazione cloud in background ----
+# La camera ha un client RTMP integrato: SET_RTMP_ADDR (URL UTF-8) → START_RTMP
+# (int BE a 4 byte) → la camera PUSHA il video verso l'ingest indicato. È la
+# stessa macchina del cloud recording 24/7: l'app 7.0.1 NON li chiama mai in
+# Java (i comandi li invia il server YI sulla sessione della camera) e i clip
+# cloud sono segmenti .ts con timeline continua (tipici di un ingest RTMP).
+# Per Frigate: si punta l'indirizzo al NOSTRO mediamtx (porta 1935) → flusso
+# nativo continuo senza il canale media P2P (niente sustain problem).
+# Fonti: AVIOCTRLDEFs.java (944–963), CameraCommandHelper.startRtmpStream/
+# startAndSetAddrRtmpStream/stopRtmpStream, smali SMsgAVIoctlStartRtmpReq/
+# SMsgAVIoctlQueryRtmpStateResp/SMsgAVIoctlCloudStorageResp.
+IOCTRL_START_RTMP = 0x03B0        # IOTYPE_USER_IPCAM_START_RTMP_REQ (944)
+IOCTRL_STOP_RTMP = 0x03B2         # IOTYPE_USER_IPCAM_STOP_RTMP_REQ (946)
+IOCTRL_QUERY_RTMP_STAT = 0x03B4   # IOTYPE_USER_IPCAM_QUERY_RTMP_STAT_REQ (948)
+IOCTRL_SET_RTMP_ADDR = 0x03B6     # IOTYPE_USER_IPCAM_SET_RTMP_ADDR_REQ (950)
+IOCTRL_STOP_CLOUD_STORAGE = 0x03C2  # IOTYPE_USER_IPCAM_STOP_CLOUD_STORAGE_REQ (962)
+RTMP_RESP_TYPES = frozenset({
+    IOCTRL_START_RTMP + 1, IOCTRL_STOP_RTMP + 1, IOCTRL_QUERY_RTMP_STAT + 1,
+    IOCTRL_SET_RTMP_ADDR + 1, IOCTRL_STOP_CLOUD_STORAGE + 1,
+})
+
 # offset dei dati nel corpo di una risposta di controllo:
 # d1 00 <ctr2> (4) + TNPHead (8) + TNPIOCtrlHead (40)
 CTRL_DATA_OFFSET = 4 + 8 + 40
@@ -307,6 +328,22 @@ def parse_devinfo(resp_pkt: bytes | None) -> dict | None:
         "close_light": d[49],
         "record_mode": d[52],
     }
+
+
+def parse_rtmp_state(resp_pkt: bytes | None) -> dict | None:
+    """SMsgAVIoctrlQueryRtmpStateResp — risposta a SET_RTMP_ADDR/START_RTMP/
+    STOP_RTMP/QUERY_RTMP_STAT: leftTime = int BE @0 (tempo residuo del push,
+    secondi), url = stringa @4 (max 512 B). None se la risposta non porta i
+    dati (ffff o tipo inatteso)."""
+    rtype = ctrl_response_type(resp_pkt)
+    if rtype not in RTMP_RESP_TYPES:
+        return None
+    d = resp_pkt[4 + CTRL_DATA_OFFSET:]
+    if len(d) < 4:
+        return None
+    left = struct.unpack(">I", d[:4])[0]
+    url = d[4:516].split(b"\x00")[0].decode(errors="replace").strip()
+    return {"left_time": left, "url": url}
 
 
 def gen_nonce(n: int) -> str:
@@ -467,18 +504,14 @@ class TnpSession:
             s.close()
         return False
 
-    def start_video(self, password: str | None = None) -> bool:
-        """Cold start ESATTO (§7w, TnpCamera.java + pcap):
-        0xa0 ai server P2P → e0 → controlli IOCTRL autenticati
-        (0x1300 UPDATE_CHECK_PHONE → 0x03c0 TRIGGER_SYNC → 0x03c0 ancora →
-        0x2345 TNP_START_REALTIME con data [1, resolution, 1, 0]) — ciascuno
-        con attesa della risposta del relay e ack. Ritorna True se il relay
-        risponde ai controlli."""
+    def _session_preamble(self, password: str | None = None) -> dict | None:
+        """Preamble comune di una sessione video: wake 0x1a → check-online
+        0x18 → notify 0xa0 → heartbeat e0 → controlli auth (0x1300 + DEVINFO,
+        con power-on se in privacy). Ritorna il devinfo o None. NON avvia
+        l'encoder: a quello pensano start_video (0x2345) o start_rtmp_push."""
         if not self.sock or not self.server:
-            return False
+            return None
         if password is None:
-            # viewPassword dal db dell'app (device_info) — ruota a ogni refresh
-            # della device list; aggiornabile via YIMIRROR_P2P_PASSWORD o .env
             from env_loader import load_env
             load_env()
             password = os.environ.get("YIMIRROR_P2P_PASSWORD", "")
@@ -518,13 +551,8 @@ class TnpSession:
             if pkt[:2] == b"\xf1\xe0":
                 self.sock.sendto(b"\xf1\xe1\x00\x00", self.server)
         # controlli DIRETTI sulla sessione connessa (§7x: niente refresh
-        # 0x41→0x42 per controllo). Sequenza di avvio video VERIFICATA DAL VIVO
-        # (§7x-novies, 15/11): 1300 (UPDATE_CHECK_PHONE) → DEVINFO per leggere
-        # close_camera (privacy) → **0x2345 START_REALTIME con data 01020100**:
-        # È QUESTO il trigger dei frame (il video parte subito dopo), NON 0x1311
-        # né 0x03c0 (quelli rispondono ma non avviano l'encoding). La viewPassword
-        # DEVE essere fresca o l'authInfo dei controlli è rifiutato (ffff).
-        ok = False
+        # 0x41→0x42 per controllo). La viewPassword DEVE essere fresca o
+        # l'authInfo dei controlli è rifiutato (ffff).
         self.send_control(IOCTRL_UPDATE_CHECK_PHONE, b"\x00" * 4)
         # DEVINFO per close_camera (privacy mode) — se spenta la riaccendo
         info = parse_devinfo(self.send_control(IOCTRL_DEVINFO_REQ, b"\x00" * 4))
@@ -535,6 +563,18 @@ class TnpSession:
             if info["close_camera"] == 1 and self.desired_on:
                 print("[power] camera in privacy mode → riaccendo")
                 self.set_camera_power(True)
+        return info
+
+    def start_video(self, password: str | None = None) -> bool:
+        """Cold start ESATTO (§7w, TnpCamera.java + pcap):
+        preamble (_session_preamble) → **0x2345 START_REALTIME con data
+        01020100**: È QUESTO il trigger dei frame (il video parte subito
+        dopo), NON 0x1311 né 0x03c0 (quelli rispondono ma non avviano
+        l'encoding). La viewPassword DEVE essere fresca o l'authInfo dei
+        controlli è rifiutato (ffff). Ritorna True se il relay risponde."""
+        info = self._session_preamble(password)
+        if info is None and not getattr(self, "p2p_password", ""):
+            return False
         # START_REALTIME = il trigger del video
         resp = self.send_control(IOCTRL_START_REALTIME,
                                  bytes.fromhex("01020100"), wait=2.0)
@@ -542,6 +582,18 @@ class TnpSession:
         ok = rt is None or rt != 0xFFFF   # il 2345 spesso non risponde: il video parte
         print(f"[video] START_REALTIME inviato (resp={rt})")
         return ok
+
+    def start_rtmp_push(self, url: str, param: int = 0,
+                        password: str | None = None) -> tuple[dict | None, dict | None]:
+        """Avvio del push RTMP (registrazione cloud in background): preamble
+        (_session_preamble) → SET_RTMP_ADDR 0x03B6 (URL UTF-8) → START_RTMP
+        0x03B0 (int BE). NIENTE 0x2345: il video NON passa dal canale P2P,
+        la camera lo spinge direttamente verso l'ingest RTMP indicato (come
+        fa col cloud YI). Ritorna (devinfo, stato rtmp parsato)."""
+        info = self._session_preamble(password)
+        self.rtmp_set_addr(url)
+        st = self.rtmp_start(param)
+        return info, st
 
     def rehandshake(self, timeout: float = 8.0) -> bool:
         """Handshake COMPLETO sullo stesso socket (§7w-ter: l'app rifà
@@ -708,6 +760,87 @@ class TnpSession:
             print(f"[devinfo] close_camera={info['close_camera']} "
                   f"tf={info['tfstat']} hw={info['hardware_version']}")
         return info
+
+    def rtmp_set_addr(self, url: str, wait: float = 3.0) -> dict | None:
+        """SET_RTMP_ADDR 0x03B6: imposta l'URL RTMP verso cui la camera farà
+        push (payload = URL UTF-8, come
+        CameraCommandHelper.startAndSetAddrRtmpStream)."""
+        resp = self.send_control(IOCTRL_SET_RTMP_ADDR, url.encode(), wait=wait)
+        st = parse_rtmp_state(resp)
+        print(f"[rtmp] set_addr '{url}' -> {st}")
+        return st
+
+    def rtmp_start(self, param: int = 0, wait: float = 3.0) -> dict | None:
+        """START_RTMP 0x03B0: avvia il push RTMP. payload = int BE a 4 byte
+        (SMsgAVIoctlStartRtmpReq.parseContent). Significato del parametro da
+        determinare dal vivo (0 = default; candidati: durata/qualità/canale)."""
+        resp = self.send_control(IOCTRL_START_RTMP, struct.pack(">I", param),
+                                 wait=wait)
+        st = parse_rtmp_state(resp)
+        print(f"[rtmp] start({param}) -> {st}")
+        return st
+
+    def rtmp_stop(self, wait: float = 3.0) -> dict | None:
+        """STOP_RTMP 0x03B2: ferma il push RTMP (payload 8 zero, come l'app)."""
+        resp = self.send_control(IOCTRL_STOP_RTMP, b"\x00" * 8, wait=wait)
+        st = parse_rtmp_state(resp)
+        print(f"[rtmp] stop -> {st}")
+        return st
+
+    def rtmp_query(self, wait: float = 3.0) -> dict | None:
+        """QUERY_RTMP_STAT 0x03B4: stato corrente del push (payload 8 zero).
+        Risposta: left_time (s) + url attivo."""
+        resp = self.send_control(IOCTRL_QUERY_RTMP_STAT, b"\x00" * 8, wait=wait)
+        return parse_rtmp_state(resp)
+
+    def hold_rtmp(self, seconds: float, stat_interval: float = 20.0):
+        """GENERATORE a chiamata unica: tiene la sessione TNP calda mentre la
+        camera pusha RTMP verso l'ingest (keepalive e0 + ack d100 + risposta
+        ai re-invito 0x40/0x41 — NIENTE 0x2345/0x03c0/0x18: il video NON passa
+        da qui e lo spam comandi non serve). Ogni `stat_interval` s interroga
+        lo stato del push e lo emette (`yield dict | None`); altrimenti
+        `yield None` sui tick di housekeeping."""
+        if not self.sock:
+            return
+        start = time.time()
+        last_ack = 0.0
+        last_stat = 0.0
+        ack_interval = float(os.environ.get("YIMIRROR_RTMP_KEEPALIVE", "5"))
+        self.sock.settimeout(0.5)
+        while time.time() - start < seconds:
+            now = time.time()
+            if now - last_ack >= ack_interval:
+                self.sock.sendto(b"\xf1\xe0\x00\x04\xa2\x05\x04\x00", self.server)
+                last_ack = now
+            if now - last_stat >= stat_interval and hasattr(self, "p2p_password"):
+                yield self.rtmp_query(wait=2.0)
+                last_stat = now
+                continue
+            try:
+                data, _ = self.sock.recvfrom(65535)
+            except socket.timeout:
+                yield None
+                continue
+            if len(data) < 4 or data[0] != 0xF1:
+                yield None
+                continue
+            if data[1] == MSG_ALIVE:
+                self.sock.sendto(b"\xf1\xe1\x00\x00", self.server)
+                yield None
+                continue
+            if data[1] in (MSG_CHALLENGE, MSG_CONNECT):  # 0x40 re-invito / 0x41 relay
+                tgt = getattr(self, "target", None) or self.server
+                r41 = build_connect_response(self.p2pid, self.license,
+                                             b"", ts=int(time.time()))[4:]
+                self.sock.sendto(header(MSG_CONNECT, len(r41)) + r41, tgt)
+                yield None
+                continue
+            if data[1] == 0xD0:
+                body = data[4:]
+                if body[:2] == b"\xd1\x00":
+                    ctr = struct.unpack(">H", body[2:4])[0]
+                    self.sock.sendto(ack_control_0xd1(ctr), self.server)
+            yield None
 
     def set_camera_power(self, on: bool, retries: int = 3) -> bool:
         """Privacy mode reale (CLOSE_CAMERA 0x1304): on=True accende la camera,

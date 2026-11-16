@@ -9,6 +9,7 @@ services:
     restart: unless-stopped
     ports:
       - "8554:8554"
+      - "1935:1935"    # RTMP: la camera PUSHA qui (registrazione cloud in background)
     environment:
       - TZ=${TZ:-Europe/Rome}
       - MTX_AUTHINTERNALUSERS=${RTSP_USER}:${RTSP_PASS}
