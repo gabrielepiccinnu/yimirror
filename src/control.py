@@ -37,6 +37,7 @@ class ProxyState:
         self.close_camera: int | None = None
         self.last_frame_ts: float = 0.0
         self.server: str = ""
+        self.detail: dict | None = None   # dettagli diagnostici (es. risposte RTMP)
         self._on_change = threading.Event()
         self._mqtt = None                 # client MQTT per il publish di stato
 
@@ -62,7 +63,8 @@ class ProxyState:
 
     # --- stato effettivo --------------------------------------------------
     def update(self, *, status: str | None = None, close_camera: int | None = None,
-               frame: bool = False, server: str | None = None) -> None:
+               frame: bool = False, server: str | None = None,
+               detail: dict | None = None) -> None:
         with self._lock:
             if status is not None:
                 self.status = status
@@ -70,6 +72,8 @@ class ProxyState:
                 self.close_camera = close_camera
             if server is not None:
                 self.server = server
+            if detail is not None:
+                self.detail = detail
             if frame:
                 self.last_frame_ts = time.time()
         self.publish()
@@ -90,6 +94,7 @@ class ProxyState:
                 "close_camera": self.close_camera,
                 "last_frame_age_s": age,
                 "server": self.server,
+                "detail": self.detail,
             }
 
     # --- publish MQTT -----------------------------------------------------

@@ -39,6 +39,18 @@ log = logging.getLogger("yimirror.rtmp_push")
 RTMP_URL = os.environ.get("RTMP_URL", "")
 
 
+def _sanitize(st: dict | None) -> dict | None:
+    """Rimuove le credenziali dall'URL (che la camera echoa) prima di
+    esporlo su API/MQTT."""
+    if not st:
+        return st
+    import re
+    out = dict(st)
+    if isinstance(out.get("url"), str):
+        out["url"] = re.sub(r"://[^@/]+@", "://***@", out["url"])
+    return out
+
+
 def push_rtmp_loop() -> None:
     """Macchina a stati come push_native_loop, ma il media passa dal push
     RTMP della camera (camera → mediamtx), non dal canale P2P. La sessione
@@ -145,13 +157,15 @@ def push_rtmp_loop() -> None:
                 state.update(server=str(session.server),
                              close_camera=session.devinfo.get("close_camera"))
             if st is not None:
+                state.update(detail={"rtmp_start": _sanitize(st)})
+            if st is not None and "left_time" in st:
                 log.info("[rtmp] push avviato: left_time=%s url='%s'",
                          st.get("left_time"), st.get("url") or rtmp_url)
                 state.update(status="streaming",
                              close_camera=session.devinfo.get("close_camera"))
             else:
-                log.warning("[rtmp] start senza risposta reale (relay muto o "
-                            "camera non pronta) — si tiene la sessione calda")
+                log.warning("[rtmp] start senza dati reali (st=%s) — si tiene "
+                            "la sessione calda", st)
 
         # --- hold del canale comandi + poll dello stato del push -----------
         last_stat = time.time()
@@ -162,11 +176,16 @@ def push_rtmp_loop() -> None:
                     break
                 now = time.time()
                 if st is not None:
-                    last_stat = now
-                    log.info("[rtmp] stat: left_time=%s url='%s'",
-                             st.get("left_time"), st.get("url"))
-                    state.update(status="streaming",
+                    state.update(detail={"rtmp_query": _sanitize(st)},
                                  close_camera=session.devinfo.get("close_camera"))
+                    if "left_time" in st:
+                        last_stat = now
+                        log.info("[rtmp] stat: left_time=%s url='%s'",
+                                 st.get("left_time"), st.get("url"))
+                        state.update(status="streaming",
+                                     close_camera=session.devinfo.get("close_camera"))
+                    else:
+                        log.warning("[rtmp] risposta senza dati reali: %s", st)
                 if now - last_pub >= heartbeat:
                     state.publish()
                     last_pub = now

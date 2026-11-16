@@ -333,17 +333,19 @@ def parse_devinfo(resp_pkt: bytes | None) -> dict | None:
 def parse_rtmp_state(resp_pkt: bytes | None) -> dict | None:
     """SMsgAVIoctrlQueryRtmpStateResp — risposta a SET_RTMP_ADDR/START_RTMP/
     STOP_RTMP/QUERY_RTMP_STAT: leftTime = int BE @0 (tempo residuo del push,
-    secondi), url = stringa @4 (max 512 B). None se la risposta non porta i
-    dati (ffff o tipo inatteso)."""
+    secondi), url = stringa @4 (max 512 B). Il campo `rtype` è SEMPRE presente
+    quando esiste una risposta (anche 0xFFFF o tipo inatteso, per diagnosi);
+    left_time/url compaiono solo se il tipo è della famiglia RTMP."""
     rtype = ctrl_response_type(resp_pkt)
-    if rtype not in RTMP_RESP_TYPES:
+    if rtype is None:
         return None
-    d = resp_pkt[4 + CTRL_DATA_OFFSET:]
-    if len(d) < 4:
-        return None
-    left = struct.unpack(">I", d[:4])[0]
-    url = d[4:516].split(b"\x00")[0].decode(errors="replace").strip()
-    return {"left_time": left, "url": url}
+    out: dict = {"rtype": rtype}
+    if rtype in RTMP_RESP_TYPES:
+        d = resp_pkt[4 + CTRL_DATA_OFFSET:]
+        if len(d) >= 4:
+            out["left_time"] = struct.unpack(">I", d[:4])[0]
+            out["url"] = d[4:516].split(b"\x00")[0].decode(errors="replace").strip()
+    return out
 
 
 def gen_nonce(n: int) -> str:
