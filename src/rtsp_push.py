@@ -182,13 +182,24 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
         # all'indietro → Frigate resta fermo). Si FORZA il framerate d'ingresso
         # con `-r` (opzione di INPUT, prima di `-i`): il demuxer h264 grezzo
         # assegna timestamp sequenziali (0, 1/fps, 2/fps, …) in ordine di
-        # decodifica → DTS strettamente monotòni a prescindere dalle raffiche
-        # → stream fluido.
-        fps = os.environ.get("YIMIRROR_FPS", "15")
-        cmd = ["ffmpeg", "-loglevel", "warning",
-               "-r", fps, "-f", "h264", "-i", "pipe:0",
-               "-c", "copy", "-f", "rtsp", "-rtsp_transport", "tcp", RTSP_URL]
-        p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        # decodifica → DTS strettamente monotòni a prescindere dalle raffiche.
+        # FLUIDITÀ: un `-r` fisso sbagliato rende il video accelerato (se la
+        # camera va più piano) o in ritardo crescente (se va più veloce). Quindi
+        # si MISURA l'fps reale sui primi secondi di stream e si avvia ffmpeg con
+        # quel valore. Durante la misura i frame (dal primo keyframe) si
+        # bufferizzano e poi si riversano in ffmpeg. `YIMIRROR_FPS` forza il
+        # valore e salta la misura.
+        fps_override = os.environ.get("YIMIRROR_FPS", "").strip()
+        MEASURE_SECONDS = float(os.environ.get("YIMIRROR_MEASURE_SECONDS", "4"))
+        MEASURE_MIN_FRAMES = int(os.environ.get("YIMIRROR_MEASURE_MIN_FRAMES", "20"))
+
+        def start_ffmpeg(fps: str) -> "subprocess.Popen":
+            cmd = ["ffmpeg", "-loglevel", "warning",
+                   "-r", fps, "-f", "h264", "-i", "pipe:0",
+                   "-c", "copy", "-f", "rtsp", "-rtsp_transport", "tcp", RTSP_URL]
+            return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+        p: "subprocess.Popen | None" = None   # ffmpeg: avviato dopo la misura fps
         start = time.time()
         last_pub = 0.0
         last_frame = start
@@ -196,9 +207,12 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
         # L'I-frame YI (unwrap → `00 00 00 01 67` = SPS+PPS+IDR) è l'UNICO frame
         # che porta SPS/PPS: i P-frame no. Se ffmpeg riceve per primo un P-frame
         # va in "non-existing PPS 0 / dimensions not set" e non apre l'output.
-        # → scarta i P-frame finché non è passato il primo keyframe di QUESTA
-        # sessione ffmpeg (seen_key si azzera a ogni (ri)avvio di ffmpeg).
+        # → scarta i P-frame finché non è passato il primo keyframe.
         seen_key = False
+        buf_frames: list[bytes] = []          # frame in attesa della misura fps
+        measure_start = 0.0                    # tempo del primo keyframe
+        ts_first = ts_last = None              # ts_ms camera (diagnostica fps reale)
+        ts_count = 0
         # Niente frame: si TIENE la sessione calda (run_video ri-triggera 0x2345 a
         # caldo + keepalive) e si re-handshaka solo dopo REHANDSHAKE_AFTER, per non
         # martellare il relay (§7x-bis). NOFRAME_DROP resta breve: se lo stream era
@@ -210,27 +224,69 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
             # relay §7x-bis). Il generatore emette i frame appena arrivano
             # (fluidità) e `None` sui tick di housekeeping.
             for pkt in session.run_video(restart_every, ack_interval=1.0):
-                if p.poll() is not None or not state.desired_on:
+                if (p is not None and p.poll() is not None) or not state.desired_on:
                     break
                 if pkt is not None:
                     vf = reasm.feed(pkt)
                     if vf is not None:
                         u = unwrap_frame(vf)
                         reasm.frames.clear()
-                        # gate keyframe: scrivi solo dopo il primo I-frame (SPS/PPS)
+                        # gate keyframe: considera solo dopo il primo I-frame
                         if u and (seen_key or u.startswith(b"\x00\x00\x00\x01\x67")):
-                            seen_key = True
-                            try:
-                                p.stdin.write(u)
-                                p.stdin.flush()
-                            except (BrokenPipeError, OSError):
-                                break
-                            last_frame = time.time()
-                            state.note_frame()
-                            if not announced:
-                                state.update(status="streaming",
-                                             close_camera=session.devinfo.get("close_camera"))
-                                announced = True
+                            if not seen_key:
+                                seen_key = True
+                                measure_start = time.time()
+                            if vf.head.ts_ms:            # diagnostica fps camera
+                                if ts_first is None:
+                                    ts_first = vf.head.ts_ms
+                                ts_last = vf.head.ts_ms
+                                ts_count += 1
+                            if p is None:
+                                # fase di misura: bufferizza finché non so l'fps
+                                buf_frames.append(u)
+                                elapsed = time.time() - measure_start
+                                ready = bool(fps_override) or (
+                                    elapsed >= MEASURE_SECONDS
+                                    and len(buf_frames) >= MEASURE_MIN_FRAMES
+                                ) or (elapsed >= MEASURE_SECONDS * 2
+                                      and len(buf_frames) >= 2)
+                                if ready:
+                                    if fps_override:
+                                        fps = fps_override
+                                        src = "env"
+                                    else:
+                                        measured = len(buf_frames) / max(elapsed, 0.001)
+                                        measured = max(5.0, min(30.0, measured))
+                                        fps = f"{measured:.2f}"
+                                        src = "wall-clock"
+                                    if (ts_first is not None and ts_last is not None
+                                            and ts_last > ts_first and ts_count > 1):
+                                        cam_fps = (ts_count - 1) * 1000.0 / (ts_last - ts_first)
+                                        log.info("fps camera (ts_ms): %.2f su %d frame",
+                                                 cam_fps, ts_count)
+                                    log.info("avvio ffmpeg a %s fps (%s), %d frame bufferizzati",
+                                             fps, src, len(buf_frames))
+                                    p = start_ffmpeg(fps)
+                                    try:
+                                        for fb in buf_frames:
+                                            p.stdin.write(fb)
+                                        p.stdin.flush()
+                                    except (BrokenPipeError, OSError):
+                                        pass
+                                    buf_frames = []
+                                    last_frame = time.time()
+                                    state.note_frame()
+                                    state.update(status="streaming",
+                                                 close_camera=session.devinfo.get("close_camera"))
+                                    announced = True
+                            else:
+                                try:
+                                    p.stdin.write(u)
+                                    p.stdin.flush()
+                                except (BrokenPipeError, OSError):
+                                    break
+                                last_frame = time.time()
+                                state.note_frame()
                 now = time.time()
                 if now - last_pub >= heartbeat:   # keep-alive stato retained
                     state.publish()
@@ -243,11 +299,12 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                     log.warning("stream fermo da %.0fs — riconnessione", NOFRAME_DROP)
                     break
         finally:
-            try:
-                p.stdin.close()
-            except OSError:
-                pass
-            p.wait()
+            if p is not None:
+                try:
+                    p.stdin.close()
+                except OSError:
+                    pass
+                p.wait()
         if not state.desired_on:
             continue                      # transizione a OFF (privacy) gestita in testa
         if announced:
