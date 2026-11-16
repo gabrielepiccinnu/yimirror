@@ -272,9 +272,29 @@ class YiClient:
 
     # ------------------------------------------------------------------ cloud recording (CloudApi.kt, hm/a)
 
-    def cloud_status(self) -> list:
-        """GET /vas/v8/all/cloud/status -> [{...DeviceCloudInfo...}] per camera."""
-        data = self._request("GET", "/vas/v8/all/cloud/status", gateway=True)
+    def _vas_request(self, path: str, params: dict | None = None) -> dict:
+        """GET /vas/v8/* sul gateway con la firma VERIFICATA sulle catture MITM
+        (15/11, /tmp/yi_flows.jsonl): chiave = token&token_secret; canonical =
+        parametri in ORDINE ALFABETICO (come l'URL finale) INCLUDENDO i valori
+        vuoti (`pincode=`); niente token/timestamp in query; `region` in
+        MAIUSCOLO (EU). I nomi esatti vengono da hm/b.java: userid, region,
+        seq, uid, start_time, end_time, pincode, scene_type/ipc_type."""
+        params = dict(params or {})
+        params.setdefault("userid", self.userid or "")
+        params.setdefault("region", os.environ.get("YI_REGION", "eu").upper())
+        params.setdefault("seq", "1")
+        canonical_sorted = "&".join(f"{k}={params[k]}" for k in sorted(params))
+        params["hmac"] = hmac_sha1_base64(self.secret, canonical_sorted)
+        return self._request("GET", path, params=params, gateway=True,
+                             app_params=False)
+
+    def cloud_status(self, uid: str | None = None) -> list:
+        """GET /vas/v8/all/cloud/status -> [{...DeviceCloudInfo...}] per camera.
+        La cattura mostra la chiamata PER-DEVICE (uid obbligatorio di fatto)."""
+        params = {}
+        if uid:
+            params["uid"] = uid
+        data = self._vas_request("/vas/v8/all/cloud/status", params)
         for key in ("devices", "list", "data"):
             if isinstance(data.get(key), list):
                 return data[key]
@@ -283,21 +303,22 @@ class YiClient:
         log.warning("cloud_status(): unexpected shape: %s", str(data)[:200])
         return []
 
-    def cloud_videos(self, uid: str, start: int, end: int) -> dict:
-        """GET /vas/v8/cloud/videos -> clip references for a time range.
-
-        Exact param names and response shape are dynamic open questions (§6);
-        the endpoint exists with GET/DELETE in hm/a (l/c methods).
-        """
-        return self._request("GET", "/vas/v8/cloud/videos",
-                             params={"uid": uid, "start": start, "end": end}, gateway=True)
+    def cloud_videos(self, uid: str, start: int, end: int,
+                     pincode: str = "") -> dict:
+        """GET /vas/v8/cloud/videos -> {viewUrl, viewUrlImg} (index.m3u8 firmati).
+        Parametri esatti da hm/b.w: userid, region, seq, uid, start_time,
+        end_time, pincode (vuoto incluso nella firma!)."""
+        return self._vas_request("/vas/v8/cloud/videos",
+                                 {"uid": uid, "start_time": str(start),
+                                  "end_time": str(end), "pincode": pincode})
 
     def ts_metadata(self, uid: str, start: int, end: int,
-                    speed: int = 1, ipc_type: int = 0) -> list:
-        """GET /vas/v8/cloud/ts/metadata -> [{t: epoch_s, d: duration_s, b: flag}]."""
-        data = self._request("GET", "/vas/v8/cloud/ts/metadata",
-                             params={"uid": uid, "start": start, "end": end,
-                                     "speed": speed, "ipc_type": ipc_type}, gateway=True)
+                    scene_type: str = "1") -> list:
+        """GET /vas/v8/cloud/ts/metadata -> [{t: epoch_s, d: duration_s, b: flag}].
+        Parametri esatti da hm/b.R: uid, start_time, end_time, scene_type."""
+        data = self._vas_request("/vas/v8/cloud/ts/metadata",
+                                 {"uid": uid, "start_time": str(start),
+                                  "end_time": str(end), "scene_type": scene_type})
         if isinstance(data, list):
             return data
         for key in ("ts", "list", "data", "metadata"):
