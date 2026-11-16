@@ -55,6 +55,7 @@ def push_cloud_mirror_loop() -> None:
 
     POLL = float(os.environ.get("YIMIRROR_CLOUD_POLL", "20"))
     LOOKBACK = int(os.environ.get("YIMIRROR_CLOUD_LOOKBACK", "3600"))
+    MAX_LAG = int(os.environ.get("YIMIRROR_CLOUD_MAX_LAG", "180"))
     PACE = os.environ.get("YIMIRROR_CLOUD_PACE", "1") == "1"
     PUBLISH = os.environ.get("YIMIRROR_CLOUD_PUBLISH", "1") == "1"
     SPOOL = Path(os.environ.get("YIMIRROR_CLOUD_SPOOL", "/data/spool"))
@@ -68,7 +69,8 @@ def push_cloud_mirror_loop() -> None:
         try:
             return int(CURSOR_FILE.read_text().strip())
         except (OSError, ValueError):
-            return int(time.time()) - LOOKBACK
+            # catch-up: non riprodurre il passato — parti da MAX_LAG fa
+            return int(time.time()) - MAX_LAG
 
     def save_cursor(t: int) -> None:
         try:
@@ -142,10 +144,16 @@ def push_cloud_mirror_loop() -> None:
         now = time.time()
         cur = cursor()
         got = 0
+        skipped = 0
         try:
             for t, dur, data in fetch_new_segments(yc, uid, cur, int(now)):
-                feed(data)
                 save_cursor(t)
+                if t and now - t > MAX_LAG:
+                    # segmento troppo vecchio: il replay del passato sballa
+                    # l'allineamento OSD-vs-Frigate → salta (catch-up)
+                    skipped += 1
+                    continue
+                feed(data)
                 last_seg = now
                 got += 1
                 if got == 1:
@@ -153,6 +161,9 @@ def push_cloud_mirror_loop() -> None:
                 state.note_frame()
         except Exception as exc:  # noqa: BLE001 — il loop deve sopravvivere
             log.warning("ciclo mirror interrotto: %s", exc)
+        if skipped:
+            log.info("catch-up: saltati %d segmenti oltre %ds di ritardo",
+                     skipped, MAX_LAG)
         if got:
             log.info("segmenti scaricati: %d (ultimo %s)", got,
                      time.strftime("%H:%M:%S", time.localtime(last_seg)))
