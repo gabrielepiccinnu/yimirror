@@ -148,13 +148,14 @@ def push_cloud_mirror_loop() -> None:
                 save_cursor(t)
                 last_seg = now
                 got += 1
+                if got == 1:
+                    state.update(status="streaming")
+                state.note_frame()
         except Exception as exc:  # noqa: BLE001 — il loop deve sopravvivere
             log.warning("ciclo mirror interrotto: %s", exc)
         if got:
             log.info("segmenti scaricati: %d (ultimo %s)", got,
                      time.strftime("%H:%M:%S", time.localtime(last_seg)))
-            state.update(status="streaming")
-            state.note_frame()
         elif p is not None and now - last_seg > 120:
             # nessun segmento da un po': chiudi il publisher (mediamtx torna
             # 404 e Frigate smette di registrare il vuoto)
