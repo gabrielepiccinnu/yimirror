@@ -170,13 +170,25 @@ def push_rtmp_loop() -> None:
         # --- hold del canale comandi + poll dello stato del push -----------
         last_stat = time.time()
         last_pub = 0.0
+        ctrl_events = []                   # ring: risposte di controllo non sollecitate
         try:
             for st in session.hold_rtmp(HOLD, stat_interval=POLL):
                 if not state.desired_on:
                     break
                 now = time.time()
+                if st is not None and st.get("kind") == "ctrl":
+                    ctrl_events.append({"t": time.strftime("%H:%M:%S"),
+                                        "rtype": hex(st["rtype"]),
+                                        "raw_head": st["raw_head"]})
+                    ctrl_events = ctrl_events[-6:]
+                    log.warning("[rtmp] risposta non sollecitata: type=%s head=%s",
+                                hex(st["rtype"]), st["raw_head"])
+                    state.update(detail={"ctrl_events": list(ctrl_events)},
+                                 close_camera=session.devinfo.get("close_camera"))
+                    continue
                 if st is not None:
-                    state.update(detail={"rtmp_query": _sanitize(st)},
+                    state.update(detail={"rtmp_query": _sanitize(st),
+                                         "ctrl_events": list(ctrl_events)},
                                  close_camera=session.devinfo.get("close_camera"))
                     if "left_time" in st:
                         last_stat = now

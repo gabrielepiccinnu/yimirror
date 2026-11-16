@@ -848,6 +848,14 @@ class TnpSession:
                 if body[:2] == b"\xd1\x00":
                     ctr = struct.unpack(">H", body[2:4])[0]
                     self.sock.sendto(ack_control_0xd1(ctr), self.server)
+                    if len(body) >= 14:
+                        # risposta di controllo NON sollecitata (es. risposta
+                        # tardiva a un comando precedente): emettila come
+                        # evento per la diagnosi invece di scartarla
+                        yield {"kind": "ctrl",
+                               "rtype": struct.unpack(">H", body[12:14])[0],
+                               "raw_head": data[4:40].hex()}
+                        continue
             yield None
 
     def set_camera_power(self, on: bool, retries: int = 3) -> bool:
