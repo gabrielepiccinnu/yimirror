@@ -167,16 +167,10 @@ def push_cloud_mirror_loop() -> None:
         if got:
             log.info("segmenti scaricati: %d (ultimo %s)", got,
                      time.strftime("%H:%M:%S", time.localtime(last_seg)))
-        elif p is not None and now - last_seg > 120:
-            # nessun segmento da un po': chiudi il publisher (mediamtx torna
-            # 404 e Frigate smette di registrare il vuoto)
-            try:
-                p.stdin.close()
-            except OSError:
-                pass
-            p.wait()
-            p = None
-            log.info("nessun segmento da 120s — publisher chiuso")
+        # NOTA: il publisher NON si chiude tra un segmento e l'altro — se si
+        # chiudesse, Frigate troverebbe 404 e andrebbe in loop di riconnessione
+        # (tempesta di errori nel log). Con ffmpeg attivo ma senza dati, Frigate
+        # resta connesso in silenzio e registra solo quando arrivano i clip.
         if now - last_pub >= heartbeat:
             state.publish()
             last_pub = now
