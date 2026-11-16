@@ -86,6 +86,9 @@ def push_cloud_mirror_loop() -> None:
         if PACE:
             cmd += ["-re"]
         cmd += ["-f", "mpegts", "-i", "pipe:0",
+                "-an",                       # l'AAC del TS non è copiabile su
+                                             # RTSP (no global headers); Frigate
+                                             # registra solo video
                 "-c", "copy", "-f", "rtsp", "-rtsp_transport", "tcp", RTSP_URL]
         return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
