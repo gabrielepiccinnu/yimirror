@@ -339,7 +339,8 @@ def parse_rtmp_state(resp_pkt: bytes | None) -> dict | None:
     rtype = ctrl_response_type(resp_pkt)
     if rtype is None:
         return None
-    out: dict = {"rtype": rtype}
+    out: dict = {"rtype": rtype,
+                 "raw_head": resp_pkt[4:40].hex()}   # d1 00 ctr + TNPHead + type…
     if rtype in RTMP_RESP_TYPES:
         d = resp_pkt[4 + CTRL_DATA_OFFSET:]
         if len(d) >= 4:
@@ -647,7 +648,8 @@ class TnpSession:
         return False
 
     def send_control(self, req_id: int, data: bytes,
-                     wait: float = 3.0, resp_id: int | None = None) -> bytes | None:
+                     wait: float = 3.0, resp_id: int | None = None,
+                     any_resp: bool = False) -> bytes | None:
         """Invia UN controllo IOCTRL sulla sessione già connessa (NIENTE
         refresh 0x41→0x42) e attende la risposta 0xd0/d1 00 della camera.
 
@@ -685,7 +687,8 @@ class TnpSession:
             self.sock.sendto(ack_control_0xd1(struct.unpack(">H", body[2:4])[0]),
                              self.server)
             rtype = struct.unpack(">H", body[12:14])[0]
-            if (rtype == (req_id + 1) or (resp_id is not None and rtype == resp_id)
+            if (any_resp or rtype == (req_id + 1)
+                    or (resp_id is not None and rtype == resp_id)
                     or rtype == 0xFFFF):
                 resp = pkt
                 print(f"[ctrl] 0x{req_id:04x} -> type=0x{rtype:04x}")
@@ -767,9 +770,10 @@ class TnpSession:
         """SET_RTMP_ADDR 0x03B6: imposta l'URL RTMP verso cui la camera farà
         push (payload = URL UTF-8, come
         CameraCommandHelper.startAndSetAddrRtmpStream)."""
-        resp = self.send_control(IOCTRL_SET_RTMP_ADDR, url.encode(), wait=wait)
+        resp = self.send_control(IOCTRL_SET_RTMP_ADDR, url.encode(), wait=wait,
+                                 any_resp=True)
         st = parse_rtmp_state(resp)
-        print(f"[rtmp] set_addr '{url}' -> {st}")
+        print(f"[rtmp] set_addr -> {st}")
         return st
 
     def rtmp_start(self, param: int = 0, wait: float = 3.0) -> dict | None:
@@ -777,14 +781,15 @@ class TnpSession:
         (SMsgAVIoctlStartRtmpReq.parseContent). Significato del parametro da
         determinare dal vivo (0 = default; candidati: durata/qualità/canale)."""
         resp = self.send_control(IOCTRL_START_RTMP, struct.pack(">I", param),
-                                 wait=wait)
+                                 wait=wait, any_resp=True)
         st = parse_rtmp_state(resp)
         print(f"[rtmp] start({param}) -> {st}")
         return st
 
     def rtmp_stop(self, wait: float = 3.0) -> dict | None:
         """STOP_RTMP 0x03B2: ferma il push RTMP (payload 8 zero, come l'app)."""
-        resp = self.send_control(IOCTRL_STOP_RTMP, b"\x00" * 8, wait=wait)
+        resp = self.send_control(IOCTRL_STOP_RTMP, b"\x00" * 8, wait=wait,
+                                 any_resp=True)
         st = parse_rtmp_state(resp)
         print(f"[rtmp] stop -> {st}")
         return st
@@ -792,7 +797,8 @@ class TnpSession:
     def rtmp_query(self, wait: float = 3.0) -> dict | None:
         """QUERY_RTMP_STAT 0x03B4: stato corrente del push (payload 8 zero).
         Risposta: left_time (s) + url attivo."""
-        resp = self.send_control(IOCTRL_QUERY_RTMP_STAT, b"\x00" * 8, wait=wait)
+        resp = self.send_control(IOCTRL_QUERY_RTMP_STAT, b"\x00" * 8, wait=wait,
+                                 any_resp=True)
         return parse_rtmp_state(resp)
 
     def hold_rtmp(self, seconds: float, stat_interval: float = 20.0):
