@@ -80,3 +80,62 @@ funzioni chiave già mappate (§7w-quater): `PPPP_DoWakeup` (0x120268),
 `PPPP_TryWakeUp` (0x11d2e8), `PPPP_Proto_Send_WakeUp` (0x129638),
 `Write_HeaderV2` (0x12412c), `Recv_ALL` (0x123eac), SendMessage (0x12b8b8),
 SendMessageByTCP (0x12b418).
+
+---
+
+# Handoff sessione 11 (2026-11-16) — FLUIDITÀ risolta, nodo SUSTAIN isolato, cloud plan
+
+## Stato in una riga
+La camera streamma benissimo (provato: **l'app mostra live fluido e continuo**). Il **proxy dal
+VPS** si aggancia (riceve 0x42), prende un **burst iniziale ~4s** e poi **non sostiene il media** →
+Frigate 404 "disconnessa". Non è fluidità, non è camera/relay: è il **canale media dopo il 0x42**.
+**Proxy fermato** (Dokploy compose.stop) per non martellare il relay.
+
+## ✅ Risolto: FLUIDITÀ (commit yimirror `dfbc243`, immagine deployata `dfbc243`, reload=10)
+- `rtsp_push.push_native_loop` ora **MISURA l'fps reale** sui primi ~4s (dal primo keyframe):
+  bufferizza i frame, calcola fps wall-clock, avvia ffmpeg con quel `-r`, poi riversa il buffer.
+  Logga anche l'fps da `ts_ms` (clock camera). Fallback 15; `YIMIRROR_FPS` forza/salta la misura.
+  Env: `YIMIRROR_MEASURE_SECONDS=4`, `YIMIRROR_MEASURE_MIN_FRAMES=20`.
+- **Dato validato dal vivo**: la camera gira a **~20fps** (`fps camera (ts_ms): 19.97/20.21/20.47`),
+  NON 15. Col `-r 15` fisso il video sembrava accelerato/a scatti → era quello.
+- Nota: warning ffmpeg "Timestamps are unset in a packet" è innocuo (deprecation sul muxer RTSP),
+  lo stream apre comunque.
+
+## 🔴 Nodo aperto: SUSTAIN del media (post-0x42) — NON è fluidità
+**Test decisivo (stanotte):**
+- App aperta su live Ingresso → **fluido e continuo >60s** ⇒ camera+relay OK, niente mute globale.
+- Anche con app aperta, il proxy fa **burst-then-stop** ⇒ non è "serve l'app a tenere aperta".
+- Senza app, idem: ogni connect = 0x42 → ~82 frame @20fps (~4s) → stop; **tutti i controlli
+  `resp=None`** (0x2345, 0x03c0); Frigate `method DESCRIBE failed: 404` (nessun publisher).
+
+**Interpretazione**: il burst è il buffer iniziale che il relay inoltra; poi la camera **non
+committa/sostiene** il canale media verso il VPS come fa verso l'app. Coincide col "delta dopo
+0x42" di §7x-octies. Ipotesi da verificare col diff: destinatari di ack/keepalive (relay
+82.192.139.67 **vs IP LAN camera 192.168.1.9**, dual-target come nei pcap), token/porta presi
+dalla 0x42, binding/porta sorgente, cadenze. Possibile concausa 2°-viewer (app = sessione
+primaria) ma NON è la causa core (burst-then-stop c'è anche senza app).
+
+## ▶️ PROSSIMO PASSO deciso: DIFF OFFLINE (niente più prove dal vivo finché non indica il delta)
+Confrontare la sequenza del proxy in `src/tnp_client.py` (`connect()` + `run_video`) contro le
+catture dell'app **già disponibili**:
+- `captures/app-boot-20261115.pcap` (boot con dual-target 0x41: relay :44844 + camera LAN :16376)
+- `captures/app-liveview-20261115.pcap`
+Focus: **tutto ciò che l'app fa DOPO il 0x42** per tenere vivo il media (verso chi manda ack/e0,
+se echeggia un token/porta della 0x42, ogni quanto). Il nostro `run_video` manda ack a
+`self.server` (relay) soltanto — l'app potrebbe mandare anche verso l'endpoint LAN/porta dalla 0x40.
+
+## 🟡 Alternativa valutata: CLOUD PLAN di YI (per REGISTRAZIONE, non live)
+- Il cloud plan **non usa il P2P live**: è la **camera** che fa upload diretto ai server YI (storage
+  tipo S3). Scavalca il nodo post-0x42 → registrazione affidabile. Ma: clip a evento (continuo solo
+  sui piani cari), latenza, abbonamento, e **NON migliora il live P2P**.
+- Abbiamo già sessione cloud autenticata (`adopt_token`/`/v5`): si potrebbero **scaricare i clip via
+  API** e darli a Frigate come *recordings* (fallback affidabile, non live). Da decidere con l'utente
+  se attivarlo in parallelo al lavoro sul live.
+
+## Operatività (stato lasciato stanotte)
+- **Proxy FERMO**: `yimirror-native` stoppato via Dokploy `compose.stop` (composeId
+  `PRkP_WgtbveKcKvFMNtLw`). Per riaccendere: `compose.deploy` (o start) stesso composeId.
+- Immagine corrente nel compose: `yimirror-native:dfbc243fd209...`, `YIMIRROR_RELOAD=10`.
+- API Dokploy: base `https://app.hardsoundsensation.com`, header `x-api-key:` (token nel Portachiavi
+  `dokploy-api`), serverId `Mt316FxqE-i-NHynJCuJS`. Log solo via WebSocket (vedi `scratchpad/dlogs.py`).
+- Repo yimirror PUBBLICO: nessuna credenziale nei commit (verificato prima del push).
