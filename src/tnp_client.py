@@ -404,6 +404,25 @@ def ack_video_0xd1(seq: int) -> bytes:
     return b"\xf1\xd1\x00\x06\xd1\x03\x00\x01" + struct.pack(">H", seq)
 
 
+def build_frag_ack(wseqs: list[int]) -> bytes:
+    """Ack BATCH dei frammenti d1 02 (ARQ, verificato sul pcap dell'app):
+    `f1 d1 <4+2+2n> d1 02 00 <n 2B> <wseq 2B ×n>`. L'app li manda ogni ~0.4-1s
+    e a fine raffica: è il flow-control che la camera aspetta prima di inviare
+    il prossimo I-frame."""
+    body = b"\xd1\x02\x00" + struct.pack(">H", len(wseqs))
+    for w in wseqs:
+        body += struct.pack(">H", w & 0xFFFF)
+    return header(0xD1, len(body)) + body
+
+
+def build_frame_request(channel: int, wseq: int) -> bytes:
+    """Richiesta del prossimo frame (ARQ): `f1 d2 0004 d2 <ch> <wseq 2B>`.
+    ch=0x02 per i frammenti d1 02, ch=0x03 per i frame video d1 03.
+    L'app la manda su gap/duplicati/cambio di flusso (pcap 15/11)."""
+    return (b"\xf1\xd2\x00\x04\xd2" + bytes([channel & 0xFF])
+            + struct.pack(">H", wseq & 0xFFFF))
+
+
 class TnpSession:
     """Una sessione TNP verso una camera (sequenza di connect, §7o)."""
 
@@ -473,20 +492,35 @@ class TnpSession:
                     if data[:2] != b"\xf1\x40" or len(data) < 12:
                         continue
                     body = data[4:]
-                    port = struct.unpack("<H", body[2:4])[0]   # flag(2) + porta(2 LE)
-                    target_ip = ".".join(str(b) for b in body[4:8][::-1])
-                    target = (target_ip, port)
-                    if target_ip.startswith("192.168.") or target_ip.startswith("10."):
-                        self.lan_target = target   # il target LAN (camera diretta)
-                    else:
-                        self.target = target       # il relay
-                    # 7. 0x41 verso il target — FIRMATA (§7w: HMAC(License, body)[:16])
+                    # la 0x40 può portare DUE endpoint (relay + camera LAN,
+                    # §7x-octies: "2 target"). L'app risponde 0x41 a ENTRAMBI:
+                    # è l'anello che committa la sessione media lato camera.
+                    targets: list[tuple[str, int]] = []
+                    for off in (2, 8):
+                        if len(body) < off + 8:
+                            break
+                        port = struct.unpack("<H", body[off:off + 2])[0]
+                        t_ip = ".".join(str(b) for b in body[off + 2:off + 6][::-1])
+                        if t_ip and t_ip != "0.0.0.0":
+                            targets.append((t_ip, port))
+                    for t_ip, port in targets:
+                        if t_ip.startswith("192.168.") or t_ip.startswith("10."):
+                            self.lan_target = (t_ip, port)   # camera diretta (LAN)
+                        else:
+                            self.target = (t_ip, port)       # il relay
+                    # 7. 0x41 verso TUTTI i target — FIRMATA (§7w: HMAC(License,
+                    # body)[:16]); dual-target come l'app
                     r41 = build_connect_response(self.p2pid, self.license,
                                                  body, ts=int(time.time()))[4:]
-                    s.sendto(header(MSG_CONNECT, len(r41)) + r41, target)
+                    pkt41 = header(MSG_CONNECT, len(r41)) + r41
+                    for t_ip, port in targets:
+                        try:
+                            s.sendto(pkt41, (t_ip, port))
+                        except OSError:
+                            pass
                     # 8. attesa 0x42 dal relay — il relay prima risponde con una
-                    # sua 0x41 (d2040200): come l'app, ritrasmettiamo la 0x41
-                    # finché non arriva la 0x42 (§7w)
+                    # sua 0x41 (d2040200): come l'app, ritrasmettiamo la 0x41 a
+                    # TUTTI i target finché non arriva la 0x42 (§7w)
                     deadline = time.time() + timeout
                     while time.time() < deadline:
                         try:
@@ -494,7 +528,11 @@ class TnpSession:
                         except socket.timeout:
                             break
                         if data2[:2] == b"\xf1\x41":
-                            s.sendto(header(MSG_CONNECT, len(r41)) + r41, target)
+                            for t_ip, port in targets:
+                                try:
+                                    s.sendto(pkt41, (t_ip, port))
+                                except OSError:
+                                    pass
                             continue
                         if data2[:2] == b"\xf1\x42":
                             self.h42 = data2          # corpo 0x42: candidato seed seq
@@ -950,18 +988,36 @@ class TnpSession:
             self.video_seq = 0            # ack-counter PERSISTENTE tra le chiamate
         if not hasattr(self, "_last_vframe"):
             self._last_vframe = 0.0        # ultimo frame video ricevuto (persistente)
+        # ---- ARQ del canale media (replica ESATTA dell'app, pcap 15/11) ----
+        # L'app: ack per-frame d1 03 (echo wseq), ack BATCH d1 02 dei frammenti
+        # dell'I-frame, richieste d2 02/d2 03 del prossimo frame atteso su
+        # gap/duplicati/cambi flusso, e NIENTE 0x03c0/0x18/ack-ritmici durante
+        # lo stream. La camera usa questi ack come flow-control: senza i batch
+        # d1 02 smette di inviare (il "burst-then-stop" del proxy).
+        frag_acks: list[int] = []          # wseq frammenti d1 02 da ackare
+        last_frag_flush = 0.0
+        next_vseq: int | None = None       # prossimo wseq atteso (flusso d1 03)
+        last_frag: int | None = None       # ultimo wseq frammento d1 02
+        last_pull = 0.0
         self.sock.settimeout(0.2)
         while time.time() - start < seconds:
             now = time.time()
             if now - last_ack >= ack_interval:
-                self.sock.sendto(ack_video_0xd1(self.video_seq), self.server)
-                self.video_seq = (self.video_seq + 1) & 0xFFFF
+                # SOLO heartbeat e0: l'app NON manda ack ritmici d103 coi
+                # contatori propri (la camera li interpreta come ack di frame
+                # inesistenti) né 0x18/0x03c0 mentre lo stream scorre.
                 self.sock.sendto(b"\xf1\xe0\x00\x04\xa2\x05\x04\x00", self.server)
                 last_ack = now
-            if now - last_check >= _CHECK_INTERVAL and self.servers:
-                # check-online periodico (0x18). Ritmo moderato per non
-                # saturare il relay: martellarlo porta al rate-limit/mute del
-                # relay (§7x-bis). Tunabile via YIMIRROR_CHECK_INTERVAL.
+            # flush dei frammenti in sospeso (batch d1 02, come l'app)
+            if frag_acks and (len(frag_acks) >= 16
+                              or now - last_frag_flush >= 0.4):
+                self.sock.sendto(build_frag_ack(frag_acks), self.server)
+                frag_acks = []
+                last_frag_flush = now
+            # check-online 0x18 SOLO a flusso fermo da >10s (l'app non lo
+            # manda durante lo stream — lo spam contribuiva al mute del relay)
+            if (now - last_check >= _CHECK_INTERVAL and self.servers
+                    and now - self._last_vframe > 10.0):
                 for srv in self.servers:
                     try:
                         self.sock.sendto(build_check_online(self.p2pid),
@@ -969,11 +1025,22 @@ class TnpSession:
                     except OSError:
                         pass
                 last_check = now
-            # TRIGGER_SYNC 0x03c0 periodico: l'app lo ri-manda ~ogni 10s mentre
-            # lo stream scorre (§7w). Fire-and-forget, come fa l'app.
-            if (now - last_sync >= _SYNC_INTERVAL and hasattr(self, "p2p_password")):
+            # TRIGGER_SYNC 0x03c0 OGNI ~10s ANCHE DURANTE lo stream — è ciò che
+            # fa l'app nel pcap app-boot (3.9s, 13.9s, 14.0s mentre i frame
+            # scorrono): è il keep-alive dell'encoder della camera.
+            if (now - last_sync >= _SYNC_INTERVAL
+                    and hasattr(self, "p2p_password")):
                 self.send_control(IOCTRL_TRIGGER_SYNC, b"\x00" * 4, wait=0.0)
                 last_sync = now
+            # pull del prossimo frame atteso quando il flusso si ferma (l'app
+            # manda d2 03 <next> in queste finestre — es. 3.56, 15.120).
+            # Cap a 30s di stall: oltre, pensa il re-handshake (niente spam
+            # d2 che può contribuire al mute del relay).
+            if (next_vseq is not None and now - last_pull >= 0.5
+                    and 0.3 <= now - self._last_vframe <= 30.0):
+                self.sock.sendto(build_frame_request(0x03, next_vseq),
+                                 self.server)
+                last_pull = now
             # Ri-triggero il video con START_REALTIME SOLO se non arrivano frame
             # da >_RETRIGGER s (§7x-novies). FONDAMENTALE: NON ri-mandarlo mentre
             # lo stream scorre — ri-triggerare di continuo fa ripartire l'encoder
@@ -1005,11 +1072,18 @@ class TnpSession:
                 # §7x-quater: quando la camera esce dallo sleep RE-INVITA con 0x40;
                 # va rifirmato e risposto con 0x41 verso il target, o la sessione
                 # resta "vecchia" e lo stream non parte mai. Lo stesso vale se il
-                # relay rimanda una sua 0x41.
-                tgt = getattr(self, "target", None) or self.server
+                # relay rimanda una sua 0x41. DUAL-TARGET come l'app (§7x-octies):
+                # 0x41 anche verso la camera LAN se raggiungibile — committa la
+                # sessione media lato camera.
                 r41 = build_connect_response(self.p2pid, self.license,
                                              b"", ts=int(time.time()))[4:]
-                self.sock.sendto(header(MSG_CONNECT, len(r41)) + r41, tgt)
+                pkt41 = header(MSG_CONNECT, len(r41)) + r41
+                for tgt in (getattr(self, "target", None), getattr(self, "lan_target", None)):
+                    if tgt:
+                        try:
+                            self.sock.sendto(pkt41, tgt)
+                        except OSError:
+                            pass
                 yield None
                 continue
             if data[1] == 0x42:  # 0x42: sessione (ri)confermata
@@ -1023,8 +1097,31 @@ class TnpSession:
                     ctr = struct.unpack(">H", body[2:4])[0]
                     self.sock.sendto(ack_control_0xd1(ctr), self.server)
                     yield None
-                elif body[:2] in (b"\xd1\x02", b"\xd1\x03"):
+                elif body[:2] == b"\xd1\x02":
+                    # frammento I-frame: si accumula e si acka in BATCH (d1 02)
                     seq = struct.unpack(">H", body[2:4])[0]
+                    frag_acks.append(seq)
+                    last_frag = seq
+                    self._last_vframe = now
+                    yield data
+                elif body[:2] == b"\xd1\x03":
+                    seq = struct.unpack(">H", body[2:4])[0]
+                    if frag_acks:
+                        # fine raffica frammenti → flush batch + richiesta del
+                        # prossimo frammento (d2 02), come l'app al cambio flusso
+                        self.sock.sendto(build_frag_ack(frag_acks), self.server)
+                        frag_acks = []
+                        last_frag_flush = now
+                        if last_frag is not None:
+                            self.sock.sendto(
+                                build_frame_request(0x02, (last_frag + 1) & 0xFFFF),
+                                self.server)
+                    # gap/duplicato sul flusso video → richiesta del prossimo
+                    # atteso (d2 03), come l'app (duplicato 5635 → d2 03 5637)
+                    if next_vseq is not None and seq != next_vseq:
+                        self.sock.sendto(build_frame_request(0x03, next_vseq),
+                                         self.server)
+                    next_vseq = (seq + 1) & 0xFFFF
                     self.sock.sendto(ack_video_0xd1(seq), self.server)
                     self._last_vframe = now       # stream vivo → non ri-triggerare
                     yield data                    # emetti il frame SUBITO
