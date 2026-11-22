@@ -33,6 +33,24 @@ FRAME_HEAD_LEN = 24
 VIDEO_WRAPPER_LEN = 12
 CODEC_H264 = 0x4E
 
+# Codec audio (AVFrame/AVIOCTRLDEFs, com/tutk/IOTC): l'app decodifica l'audio della
+# camera con DecodeAAC (AntsAudioPlayer.AUDIO_CODEID_AAC=138=0x8A). Il codec_id sta
+# nei primi 2 byte del TNPFrameHead (in chiaro anche con p2p_encrypt).
+CODEC_AUDIO_AAC = 0x8A
+CODEC_AUDIO_ADPCM = 0x8B
+CODEC_AUDIO_PCM = 0x8C      # G711/PCM (AntsAudioPlayer.G711_CODEC=140)
+CODEC_AUDIO_SPEEX = 0x8D
+CODEC_AUDIO_MP3 = 0x8E
+CODEC_AUDIO_G726 = 0x8F
+AUDIO_CODECS = {
+    CODEC_AUDIO_AAC: "aac",
+    CODEC_AUDIO_ADPCM: "adpcm",
+    CODEC_AUDIO_PCM: "pcm",
+    CODEC_AUDIO_SPEEX: "speex",
+    CODEC_AUDIO_MP3: "mp3",
+    CODEC_AUDIO_G726: "g726",
+}
+
 
 @dataclass
 class FrameHead:
@@ -100,6 +118,22 @@ class VideoFrame:
         return self.data
 
 
+@dataclass
+class AudioFrame:
+    """Frame audio dal canale TNP 1 (d1 01, attivo dopo IOCTRL 0x0300 AUDIOSTART).
+
+    L'app (ThreadRecvAudio→AVFrame ctor) parse il TNPFrameHead IN CHIARO dal
+    pacchetto e decifra SOLO il payload (frmData = bytes[24:]) con AES-ECB a
+    blocchi da 16 su TUTTO il frame (AntsUtil.decryptAudioFrame). Il byte
+    `flags` dell'head codifica il sample rate: `flags >>> 2` = indice
+    (AVFrame.getSamplerate: 0/3=16000, 1=11025, 2=12000, 4=22050, 5=24000,
+    6=32000, 7=44100, 8=48000)."""
+    head: FrameHead
+    codec_id: int
+    data: bytes          # payload audio (AAC grezzo senza ADTS di norma)
+    is_decrypted: bool = False
+
+
 class MediaCrypto:
     """AES-128-ECB media decrypt: key = primi 16 byte ASCII di (password + '0').
 
@@ -123,6 +157,24 @@ class MediaCrypto:
         except Exception:
             return False
 
+    def decrypt_audio(self, buf: bytes) -> tuple[bytes, bool]:
+        """AES-128-ECB a blocchi da 16 su TUTTO il payload audio (come
+        AntsUtil.decryptAudioFrame: `length = frmData.length / 16` — il resto
+        eventuale non multiplo di 16 resta com'è). Ritorna (dati, decifrato)."""
+        if self.cipher is None:
+            return buf, False
+        try:
+            n = len(buf) // 16
+            if n == 0:
+                return buf, False
+            out = bytearray(buf)
+            for i in range(n):
+                blk = out[i * 16:(i + 1) * 16]
+                out[i * 16:(i + 1) * 16] = self.cipher.decrypt(bytes(blk))
+            return bytes(out), True
+        except Exception:
+            return buf, False
+
 
 class FrameReassembler:
     """Estrae i frame video dai pacchetti f1d0 UDP (header a offset 16, verificato)."""
@@ -135,17 +187,20 @@ class FrameReassembler:
         self.frames: list[VideoFrame] = []
         self.stats = {"video": 0, "iframe": 0, "decrypted": 0, "audio": 0,
                       "other": 0, "partial_drop": 0}
-        self._part: dict | None = None   # frame frammentato in corso (§7x-undecies)
+        self._parts: dict[int, dict] = {}   # frame frammentato in corso, per canale
 
-    def feed(self, udp_payload: bytes) -> VideoFrame | None:
+    def feed(self, udp_payload: bytes) -> VideoFrame | AudioFrame | None:
         """Riassembla i frame dai pacchetti 0xd0 (§7x-undecies).
 
-        Un frame inizia col pacchetto che porta il TNPFrameHead (codec 0x4E a
-        offset `wrapper`); la sua lunghezza TOTALE è nei 2 byte [10:12] del
-        sub-header. I frame piccoli (P, canale d1 03) stanno in un pacchetto; gli
-        I-frame (canale d1 02) sono FRAMMENTATI su ~38 pacchetti da ~1 KB: i
-        frammenti di continuazione NON hanno head e seguono con wseq consecutivo.
-        Ritorna un VideoFrame solo quando il frame è COMPLETO."""
+        Un frame inizia col pacchetto che porta il TNPFrameHead (codec 0x4E
+        video o 0x8A AAC audio a offset `wrapper`); la sua lunghezza TOTALE è
+        nei 2 byte [10:12] del sub-header. I frame piccoli (P, canale d1 03)
+        stanno in un pacchetto; gli I-frame (canale d1 02) e l'audio (canale
+        d1 01, attivo dopo IOCTRL 0x0300) sono FRAMMENTATI su più pacchetti:
+        i frammenti di continuazione NON hanno head e seguono con wseq
+        consecutivo. Lo stato di frammentazione è per-canale, così i canali
+        video e audio interleaved non si buttano via a vicenda.
+        Ritorna il frame (VideoFrame o AudioFrame) solo quando è COMPLETO."""
         pkt = F1Packet.parse(udp_payload)
         if pkt is None or pkt.ftype != F1_DATA:
             self.stats["other"] += 1
@@ -154,53 +209,61 @@ class FrameReassembler:
         off = self.wrapper
         if len(p) < 4:
             return None
-        ch = p[1]                                   # 0x00 ctrl, 0x02 frag-video, 0x03 video
+        ch = p[1]                    # 0x00 ctrl, 0x01 audio, 0x02 I-video, 0x03 P-video
         wseq = int.from_bytes(p[2:4], "big")
         e = "big" if self.big else "little"
+        codec = int.from_bytes(p[off:off + 2], e) if len(p) >= off + 2 else -1
         has_head = (len(p) >= off + FRAME_HEAD_LEN
-                    and int.from_bytes(p[off:off + 2], e) == CODEC_H264)
+                    and (codec == CODEC_H264 or codec in AUDIO_CODECS))
         if has_head:
-            if self._part is not None:              # scarta un frammentato incompleto
+            if ch in self._parts:                # scarta un frammentato incompleto
                 self.stats["partial_drop"] += 1
-                self._part = None
+                del self._parts[ch]
             head = FrameHead.parse(p, off, self.big)
             total = int.from_bytes(p[10:12], e)     # lunghezza totale del frame payload
             first = p[off:]                          # head(24) + primo chunk
             if len(first) >= total:                  # completo in un pacchetto (P-frame)
                 return self._emit(head, bytes(first[:total]))
-            self._part = {"total": total, "buf": bytearray(first), "ch": ch,
-                          "next": (wseq + 1) & 0xFFFF, "head": head}
+            self._parts[ch] = {"total": total, "buf": bytearray(first), "ch": ch,
+                               "next": (wseq + 1) & 0xFFFF, "head": head}
             return None
         # frammento di continuazione (niente head)
-        part = self._part
-        if part is not None and ch == part["ch"] and wseq == part["next"]:
+        part = self._parts.get(ch)
+        if part is not None and wseq == part["next"]:
             part["buf"] += p[4:]                     # dati dopo `d1 0X <wseq>`
             part["next"] = (wseq + 1) & 0xFFFF
             if len(part["buf"]) >= part["total"]:
-                self._part = None
+                del self._parts[ch]
                 return self._emit(part["head"], bytes(part["buf"][:part["total"]]))
             return None
         self.stats["other"] += 1
         return None
 
-    def _emit(self, head: "FrameHead", payload: bytes) -> VideoFrame | None:
-        """payload = TNPFrameHead(24 B) + NAL. Decifra l'I-frame e registra."""
-        if head.codec_id != CODEC_H264:
-            self.stats["audio" if head.codec_id in (0x00, 0x4F, 0x50) else "other"] += 1
-            return None
-        nal = bytearray(payload[FRAME_HEAD_LEN:])
-        dec = False
-        if head.is_iframe:
-            self.stats["iframe"] += 1
-            # §7w: regione cifrata = [4..36) del NAL (dopo decrypt: SPS+PPS+inizio IDR)
-            dec = self.crypto.decrypt_iframe(nal, off=0)
-            if dec:
-                self.stats["decrypted"] += 1
-        frame = VideoFrame(head=head, data=bytes(nal), raw=bytes(payload),
-                           is_decrypted=dec)
-        self.frames.append(frame)
-        self.stats["video"] += 1
-        return frame
+    def _emit(self, head: "FrameHead", payload: bytes) -> VideoFrame | AudioFrame | None:
+        """payload = TNPFrameHead(24 B) + media. Video: decifra l'I-frame;
+        audio: decifra TUTTO il payload a blocchi ECB e registra."""
+        if head.codec_id == CODEC_H264:
+            nal = bytearray(payload[FRAME_HEAD_LEN:])
+            dec = False
+            if head.is_iframe:
+                self.stats["iframe"] += 1
+                # §7w: regione cifrata = [4..36) del NAL (dopo decrypt: SPS+PPS+inizio IDR)
+                dec = self.crypto.decrypt_iframe(nal, off=0)
+                if dec:
+                    self.stats["decrypted"] += 1
+            frame = VideoFrame(head=head, data=bytes(nal), raw=bytes(payload),
+                               is_decrypted=dec)
+            self.frames.append(frame)
+            self.stats["video"] += 1
+            return frame
+        if head.codec_id in AUDIO_CODECS:
+            raw = payload[FRAME_HEAD_LEN:]
+            data, dec = self.crypto.decrypt_audio(raw)
+            self.stats["audio"] += 1
+            return AudioFrame(head=head, codec_id=head.codec_id, data=data,
+                              is_decrypted=dec)
+        self.stats["other"] += 1
+        return None
 
     def h264(self) -> bytes:
         """Concatenazione NAL dei frame ricevuti (per dump/pipe a ffmpeg)."""

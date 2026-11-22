@@ -139,3 +139,39 @@ se echeggia un token/porta della 0x42, ogni quanto). Il nostro `run_video` manda
 - API Dokploy: base `https://app.hardsoundsensation.com`, header `x-api-key:` (token nel Portachiavi
   `dokploy-api`), serverId `Mt316FxqE-i-NHynJCuJS`. Log solo via WebSocket (vedi `scratchpad/dlogs.py`).
 - Repo yimirror PUBBLICO: nessuna credenziale nei commit (verificato prima del push).
+
+## Aggiornamento 2026-11-22 (sessione 13) — AUDIO su entrambi i percorsi
+
+**Osservazione utente**: il ponte manda le immagini ma non l'audio (Frigate muto).
+
+**Scoperta chiave (jadx + scan pcap)**: la camera NON trasmette audio di default.
+- Il comando è **IOCTRL 0x0300 AUDIOSTART** (data = 8 byte a zero) = `TnpCamera.sendStartListeningCommand`
+  → `sendIOCtrl(768, new byte[8])`; stop = **0x0301**. L'app lo manda col toggle audio della live view.
+- In TUTTE le catture (anche app-boot/app-liveview 15/11) ZERO pacchetti audio: l'audio non era mai
+  stato attivato in nessuna sessione catturata.
+- Audio = canale TNP **1** (sub-header `d1 01`), TNPFrameHead 24B in chiaro con **codec_id 0x8A (AAC)**
+  (AntsAudioPlayer.AUDIO_CODEID_AAC=138, decode via DecodeAAC; alternativi: G711=0x8C, G726=0x8F,
+  ADPCM=0x8B, MP3=0x8E, SPEEX=0x8D). Il byte `flags` dell'head codifica il sample rate (flags>>>2,
+  AVFrame.getSamplerate: 0/3=16000, 1=11025, 2=12000, 4=22050, 5=24000, 6=32000, 7=44100, 8=48000).
+- Cifratura: **AES-ECB a blocchi da 16 su TUTTO il payload** (AntsUtil.decryptAudioFrame), stessa
+  chiave `(viewPassword+"0")[:16]`, se tnpHeaderVersion>=2 (SYUPE: sì). L'head resta in chiaro.
+- 0x4114/0x4115 visti nei pcap subito dopo il 0x2345 = **getMotionDetection** (non audio).
+
+**Implementato**:
+- `tnp_proto.py`: AudioFrame, MediaCrypto.decrypt_audio, costanti codec audio, riassemblatore del
+  canale 1 con frammentazione PER-CANALE (video/audio interleaved non si buttano via a vicenda).
+- `tnp_client.py`: `start_audio()`/`stop_audio()` (0x0300/0x0301 fire-and-forget), ramo `d1 01` in
+  run_video con ack ARQ echo-wseq (stesso schema del video).
+- `rtsp_push.py`: dopo il primo keyframe → AUDIOSTART; AAC grezzo → **ADTS** (rate dal flags,
+  override `YIMIRROR_AUDIO_RATE`) → ffmpeg dual-input (pipe:0 video, pipe:1 audio via os.pipe+dup2)
+  → RTSP con 2 tracce. Attesa del primo frame audio entro `YIMIRROR_AUDIO_GRACE` (5s) prima di
+  partire solo-video (camera senza mic). `YIMIRROR_AUDIO=0` disattiva tutto.
+  Verificato in locale: smoke test riassemblatore (audio cifrato/frammentato/interleaved), ADTS
+  decodificato da ffmpeg 9, meccanismo dual-pipe OK. NB ffmpeg 9: NIENTE `-ar`/`-ac` come opzioni
+  input del demuxer aac (errore "Option sample_rate not found") — il rate lo porta l'ADTS.
+- `cloud_mirror.py` (fix precedente, ora committato): ricodifica l'AAC del TS in AAC 16kHz mono 32k
+  e lo muxa nell'RTSP (`YIMIRROR_CLOUD_AUDIO=1`) — il mirror cloud ora porta anche l'audio.
+
+**DA VERIFICARE DAL VIVO** (dopo deploy): primo frame audio del percorso nativo (codec/flags/rate
+nei log "PRIMO frame audio"), sostentamento del canale 1, audio udibile in Frigate da entrambi i
+percorsi. Se la Y623 non ha microfono, 0x0300 resta muto e il percorso resta video-only.

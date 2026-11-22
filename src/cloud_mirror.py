@@ -58,6 +58,7 @@ def push_cloud_mirror_loop() -> None:
     MAX_LAG = int(os.environ.get("YIMIRROR_CLOUD_MAX_LAG", "180"))
     PACE = os.environ.get("YIMIRROR_CLOUD_PACE", "1") == "1"
     PUBLISH = os.environ.get("YIMIRROR_CLOUD_PUBLISH", "1") == "1"
+    AUDIO = os.environ.get("YIMIRROR_CLOUD_AUDIO", "1") == "1"
     SPOOL = Path(os.environ.get("YIMIRROR_CLOUD_SPOOL", "/data/spool"))
     SPOOL.mkdir(parents=True, exist_ok=True)
     CURSOR_FILE = SPOOL.parent / "mirror_cursor.txt"
@@ -88,10 +89,14 @@ def push_cloud_mirror_loop() -> None:
         if PACE:
             cmd += ["-re"]
         cmd += ["-f", "mpegts", "-i", "pipe:0",
-                "-an",                       # l'AAC del TS non è copiabile su
-                                             # RTSP (no global headers); Frigate
-                                             # registra solo video
-                "-c", "copy", "-f", "rtsp", "-rtsp_transport", "tcp", RTSP_URL]
+                "-c:v", "copy"]
+        if AUDIO:
+            # l'AAC del TS non è copiabile su RTSP (no global headers): si
+            # RICODIFICA (mono 16kHz, costo irrisorio) — verificato dal vivo
+            cmd += ["-c:a", "aac", "-b:a", "32k", "-ar", "16000", "-ac", "1"]
+        else:
+            cmd += ["-an"]
+        cmd += ["-f", "rtsp", "-rtsp_transport", "tcp", RTSP_URL]
         return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     def feed(data: bytes) -> None:

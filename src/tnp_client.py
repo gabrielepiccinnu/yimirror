@@ -262,6 +262,8 @@ def build_notify_0xa0(p2pid: str) -> bytes:
 NONCE_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 IOCTRL_UPDATE_CHECK_PHONE = 0x1300    # UPDATE_CHECK_PHONE_REQ (4864)
+IOCTRL_AUDIOSTART = 0x0300            # IOTYPE_USER_IPCAM_AUDIOSTART (768): abilita audio camera→app
+IOCTRL_AUDIOSTOP = 0x0301             # IOTYPE_USER_IPCAM_AUDIOSTOP (769)
 IOCTRL_TRIGGER_SYNC = 0x03C0          # TRIGGER_SYNC_INFO_FROM_SERVER_REQ (960)
 IOCTRL_SET_RESOLUTION = 0x1311        # SET_RESOLUTION (4881): data = res(4BE)+useCount(4BE)
 IOCTRL_DEVINFO_REQ = 0x0330           # DEVINFO_REQ (816): data = 4 zero
@@ -402,6 +404,12 @@ def ack_control_0xd1(ctr: int) -> bytes:
 def ack_video_0xd1(seq: int) -> bytes:
     """Ack di un frame video: `f1 d1 0006 d1 03 00 01 <seq 2B>` (echo del wrapper)."""
     return b"\xf1\xd1\x00\x06\xd1\x03\x00\x01" + struct.pack(">H", seq)
+
+
+def ack_audio_0xd1(seq: int) -> bytes:
+    """Ack di un frame audio (canale 1): `f1 d1 0006 d1 01 00 01 <seq 2B>`
+    (stesso schema ARQ del video, sul canale d1 01)."""
+    return b"\xf1\xd1\x00\x06\xd1\x01\x00\x01" + struct.pack(">H", seq)
 
 
 def build_frag_ack(wseqs: list[int]) -> bytes:
@@ -623,6 +631,22 @@ class TnpSession:
         ok = rt is None or rt != 0xFFFF   # il 2345 spesso non risponde: il video parte
         print(f"[video] START_REALTIME inviato (resp={rt})")
         return ok
+
+    def start_audio(self) -> bool:
+        """IOCTRL 0x0300 AUDIOSTART con data = 8 byte a zero (TnpCamera.
+        sendStartListeningCommand): è il comando che fa partire il microfono
+        della camera sul canale TNP 1 (pacchetti d1 01). L'app lo manda col
+        toggle audio della live view; SENZA di esso la camera NON trasmette
+        audio (in tutte le nostre catture dell'app non c'è un solo pacchetto
+        audio: l'audio non era mai stato attivato). Fire-and-forget come
+        l'app (sendIOCtrl senza callback di risposta)."""
+        self.send_control(IOCTRL_AUDIOSTART, b"\x00" * 8, wait=0.0)
+        return True
+
+    def stop_audio(self) -> bool:
+        """IOCTRL 0x0301 AUDIOSTOP (8 byte a zero): spegne il microfono."""
+        self.send_control(IOCTRL_AUDIOSTOP, b"\x00" * 8, wait=0.0)
+        return True
 
     def start_rtmp_push(self, url: str, param: int = 0,
                         password: str | None = None) -> tuple[dict | None, dict | None]:
@@ -1097,6 +1121,15 @@ class TnpSession:
                     ctr = struct.unpack(">H", body[2:4])[0]
                     self.sock.sendto(ack_control_0xd1(ctr), self.server)
                     yield None
+                elif body[:2] == b"\xd1\x01":
+                    # canale AUDIO (attivo dopo IOCTRL 0x0300): ack echo per
+                    # pacchetto come per i frame video (ARQ del canale 1)
+                    seq = struct.unpack(">H", body[2:4])[0]
+                    self.sock.sendto(ack_audio_0xd1(seq), self.server)
+                    if not hasattr(self, "_last_aframe"):
+                        self._last_aframe = 0.0
+                    self._last_aframe = now
+                    yield data
                 elif body[:2] == b"\xd1\x02":
                     # frammento I-frame: si accumula e si acka in BATCH (d1 02)
                     seq = struct.unpack(">H", body[2:4])[0]

@@ -5,6 +5,8 @@ Due sorgenti:
   l'app in live view → H.264 → RTSP. Richiede adb + emulatore.
 - `--source native` (produzione, §7v/§7w): sessione TNP nativa del proxy —
   frame 0xd0 dal relay → unwrap I-frame 0x3D → annex-b → ffmpeg → RTSP.
+  Con YIMIRROR_AUDIO=1 (default) manda IOCTRL 0x0300 AUDIOSTART dopo il primo
+  keyframe e muxa l'AAC del canale TNP 1 (ADTS) come seconda traccia RTSP.
   Richiede YIMIRROR_P2PID, YIMIRROR_LICENSE, YIMIRROR_INIT_STRING.
 
 Uso:
@@ -25,6 +27,34 @@ log = logging.getLogger("yimirror.rtsp_push")
 
 ADB = os.environ.get("YIMIRROR_ADB", "adb")
 RTSP_URL = os.environ.get("RTSP_URL", "")
+
+# --- audio camera (IOCTRL 0x0300 AUDIOSTART, canale TNP 1) --------------------
+# Il byte `flags` del TNPFrameHead audio codifica il sample rate:
+# flags>>>2 = indice (AVFrame.getSamplerate, com/tutk/IOTC).
+_SR_BY_FLAG_IDX = {0: 16000, 1: 11025, 2: 12000, 3: 16000, 4: 22050,
+                   5: 24000, 6: 32000, 7: 44100, 8: 48000}
+_ADTS_IDX = {16000: 8, 11025: 10, 12000: 9, 22050: 7, 24000: 6,
+             32000: 5, 44100: 4, 48000: 3, 8000: 11}
+
+
+def _audio_rate(head) -> int:
+    return _SR_BY_FLAG_IDX.get(head.flags >> 2, 16000)
+
+
+def adts_wrap(payload: bytes, rate: int) -> bytes:
+    """AAC grezzo (senza ADTS, come lo invia la camera) → frame ADTS (7 B)
+    per il demuxer `-f aac` di ffmpeg. Profilo LC, mono."""
+    idx = _ADTS_IDX.get(rate, 8)
+    ln = len(payload) + 7
+    hdr = bytes([
+        0xFF, 0xF1,                        # sync + MPEG-4 + layer 0 + no CRC
+        0x40 | (idx << 2),                 # profile LC(01) + sf idx + priv 0 + chcfg>>2
+        0x40 | ((ln >> 11) & 0x3),         # chcfg(1) + frame len high
+        (ln >> 3) & 0xFF,
+        ((ln & 0x7) << 5) | 0x1F,
+        0xFC,                              # fullness low + num raw blocks-1 = 0
+    ])
+    return hdr + payload
 
 
 def live_view_active() -> bool:
@@ -84,7 +114,7 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from tnp_client import TnpSession
-    from tnp_proto import FrameReassembler, unwrap_frame
+    from tnp_proto import FrameReassembler, unwrap_frame, AudioFrame, AUDIO_CODECS
     from control import ProxyState, start_mqtt, start_api
 
     p2pid = os.environ.get("YIMIRROR_P2PID", "")
@@ -192,14 +222,44 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
         fps_override = os.environ.get("YIMIRROR_FPS", "").strip()
         MEASURE_SECONDS = float(os.environ.get("YIMIRROR_MEASURE_SECONDS", "4"))
         MEASURE_MIN_FRAMES = int(os.environ.get("YIMIRROR_MEASURE_MIN_FRAMES", "20"))
+        audio_enabled = os.environ.get("YIMIRROR_AUDIO", "1") not in ("0", "false", "no")
+        AUDIO_GRACE = float(os.environ.get("YIMIRROR_AUDIO_GRACE", "5"))
+        audio_rate_override = os.environ.get("YIMIRROR_AUDIO_RATE", "").strip()
+        if audio_rate_override:
+            audio_rate_override = int(audio_rate_override)
 
-        def start_ffmpeg(fps: str) -> "subprocess.Popen":
+        def start_ffmpeg(fps: str, with_audio: bool) -> "tuple[subprocess.Popen, int | None]":
+            """Video su pipe:0; audio (se with_audio) su pipe:1 = fd 1 del
+            processo (preexec dup2 della fine lettura di un os.pipe). Il
+            demuxer aac legge i frame ADTS e li timesta da sé (durata per
+            frame) → pacing audio reale senza opzioni extra."""
             cmd = ["ffmpeg", "-loglevel", "warning",
-                   "-r", fps, "-f", "h264", "-i", "pipe:0",
-                   "-c", "copy", "-f", "rtsp", "-rtsp_transport", "tcp", RTSP_URL]
-            return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                   "-r", fps, "-f", "h264", "-i", "pipe:0"]
+            if with_audio:
+                # rate e canali li porta l'ADTS: niente -ar/-ac (ffmpeg 9 non
+                # li accetta come opzioni input del demuxer aac)
+                cmd += ["-f", "aac", "-i", "pipe:1"]
+            cmd += ["-map", "0:v:0"]
+            if with_audio:
+                cmd += ["-map", "1:a:0", "-c:a", "copy"]
+            cmd += ["-c:v", "copy", "-f", "rtsp", "-rtsp_transport", "tcp", RTSP_URL]
+            aw = None
+            if with_audio:
+                ar, aw = os.pipe()
+
+                def _dup_audio():
+                    os.dup2(ar, 1)          # pipe:1 = fd 1 → fine lettura audio
+                    os.close(ar)
+
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                        pass_fds=(ar,), preexec_fn=_dup_audio)
+                os.close(ar)
+            else:
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            return proc, aw
 
         p: "subprocess.Popen | None" = None   # ffmpeg: avviato dopo la misura fps
+        aw: "int | None" = None               # fd scrittura pipe audio (se attivo)
         start = time.time()
         last_pub = 0.0
         last_frame = start
@@ -210,6 +270,9 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
         # → scarta i P-frame finché non è passato il primo keyframe.
         seen_key = False
         buf_frames: list[bytes] = []          # frame in attesa della misura fps
+        audio_sent = False                    # AUDIOSTART 0x0300 per questa sessione
+        audio_seen = False                    # primo frame audio ricevuto
+        buf_audio: list[bytes] = []           # ADTS audio in attesa di ffmpeg
         measure_start = 0.0                    # tempo del primo keyframe
         ts_first = ts_last = None              # ts_ms camera (diagnostica fps reale)
         ts_count = 0
@@ -227,8 +290,28 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                 if (p is not None and p.poll() is not None) or not state.desired_on:
                     break
                 if pkt is not None:
-                    vf = reasm.feed(pkt)
-                    if vf is not None:
+                    mf = reasm.feed(pkt)
+                    if isinstance(mf, AudioFrame):
+                        # --- audio: canale 1, dopo AUDIOSTART 0x0300 ---------
+                        rate = audio_rate_override or _audio_rate(mf.head)
+                        if not audio_seen:
+                            audio_seen = True
+                            log.info("PRIMO frame audio: codec=0x%04X (%s) "
+                                     "flags=0x%02X rate=%dHz len=%d decifrato=%s",
+                                     mf.codec_id, AUDIO_CODECS.get(mf.codec_id, "?"),
+                                     mf.head.flags, rate, len(mf.data),
+                                     mf.is_decrypted)
+                        adts = adts_wrap(mf.data, rate)
+                        if aw is not None:
+                            try:
+                                os.write(aw, adts)
+                            except OSError:
+                                pass
+                        elif p is None:
+                            buf_audio.append(adts)   # ffmpeg non ancora avviato
+                        # (se ffmpeg è partito solo-video, i frame tardivi si scartano)
+                    elif mf is not None:
+                        vf = mf
                         u = unwrap_frame(vf)
                         reasm.frames.clear()
                         # gate keyframe: considera solo dopo il primo I-frame
@@ -236,6 +319,12 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                             if not seen_key:
                                 seen_key = True
                                 measure_start = time.time()
+                                if audio_enabled and not audio_sent:
+                                    # AUDIOSTART appena la camera streamma video
+                                    # (come l'app: live aperta → toggle audio)
+                                    session.start_audio()
+                                    audio_sent = True
+                                    log.info("AUDIOSTART 0x0300 inviato")
                             if vf.head.ts_ms:            # diagnostica fps camera
                                 if ts_first is None:
                                     ts_first = vf.head.ts_ms
@@ -250,6 +339,12 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                                     and len(buf_frames) >= MEASURE_MIN_FRAMES
                                 ) or (elapsed >= MEASURE_SECONDS * 2
                                       and len(buf_frames) >= 2)
+                                if audio_enabled and not audio_seen and not fps_override:
+                                    # decide il mux audio: aspetta il primo frame
+                                    # audio entro la grazia, altrimenti parte
+                                    # solo-video (camera senza audio / 0x0300 rifiutato)
+                                    ready = (ready and
+                                             elapsed >= MEASURE_SECONDS + AUDIO_GRACE)
                                 if ready:
                                     if fps_override:
                                         fps = fps_override
@@ -264,16 +359,25 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                                         cam_fps = (ts_count - 1) * 1000.0 / (ts_last - ts_first)
                                         log.info("fps camera (ts_ms): %.2f su %d frame",
                                                  cam_fps, ts_count)
-                                    log.info("avvio ffmpeg a %s fps (%s), %d frame bufferizzati",
-                                             fps, src, len(buf_frames))
-                                    p = start_ffmpeg(fps)
+                                    with_audio = bool(audio_enabled and audio_seen)
+                                    log.info("avvio ffmpeg a %s fps (%s)%s, %d frame bufferizzati",
+                                             fps, src, " + audio" if with_audio else "",
+                                             len(buf_frames))
+                                    p, aw = start_ffmpeg(fps, with_audio)
                                     try:
                                         for fb in buf_frames:
                                             p.stdin.write(fb)
                                         p.stdin.flush()
                                     except (BrokenPipeError, OSError):
                                         pass
+                                    if aw is not None:
+                                        try:
+                                            for adts in buf_audio:
+                                                os.write(aw, adts)
+                                        except OSError:
+                                            pass
                                     buf_frames = []
+                                    buf_audio = []
                                     last_frame = time.time()
                                     state.note_frame()
                                     state.update(status="streaming",
@@ -299,6 +403,11 @@ def push_native_loop(restart_every: float = 3600.0) -> None:
                     log.warning("stream fermo da %.0fs — riconnessione", NOFRAME_DROP)
                     break
         finally:
+            if aw is not None:
+                try:
+                    os.close(aw)
+                except OSError:
+                    pass
             if p is not None:
                 try:
                     p.stdin.close()
