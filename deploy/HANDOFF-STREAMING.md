@@ -175,3 +175,7 @@ se echeggia un token/porta della 0x42, ogni quanto). Il nostro `run_video` manda
 **DA VERIFICARE DAL VIVO** (dopo deploy): primo frame audio del percorso nativo (codec/flags/rate
 nei log "PRIMO frame audio"), sostentamento del canale 1, audio udibile in Frigate da entrambi i
 percorsi. Se la Y623 non ha microfono, 0x0300 resta muto e il percorso resta video-only.
+
+**Verifica post-deploy (22/11)**: compose aggiornato (immagine 603d258, RELOAD=11) e deployato;
+DESCRIBE su 164.68.119.188:8554/ingresso = 200 con **SDP `m=video` + `m=audio`** → l'audio del
+mirror cloud arriva a Frigate. Da confermare all'orecchio dall'utente (live in Frigate UI).
